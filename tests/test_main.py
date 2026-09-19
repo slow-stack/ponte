@@ -179,6 +179,38 @@ def test_status_json_running(monkeypatch) -> None:
     )
 
 
+def test_status_json_marks_an_unanswered_check_as_unknown(monkeypatch) -> None:
+    """``healthy=false`` 但 ``health_conclusive=false``：脚本能分清“未知”与“坏了”。"""
+    import json as _json
+
+    s = _status(
+        ProfileStatus(
+            name="default",
+            healthy=False,
+            health_conclusive=False,
+            probe_error="探测连接失败（ssh 退出码 255）：23334 的状态未知",
+            remote_ports={},
+        ),
+        running=True,
+        pid=4321,
+        uptime_seconds=60.0,
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+
+    payload = _json.loads(result.output)
+    profile = payload["profiles"]["default"]
+    assert profile["healthy"] is False
+    assert profile["health_conclusive"] is False
+    assert "255" in profile["probe_error"]
+    assert profile["remote_ports"] == {}, "没观察到的端口不得写成“未监听”"
+
+
 def test_markup_health_separates_unknown_from_broken() -> None:
     """显示层：无法判定的检查是黄色“未知”，不是红色“异常”。"""
     from ponte.main import _markup_health
@@ -936,3 +968,29 @@ def test_config_shows_the_jump_host(monkeypatch) -> None:
     assert "-J ops@bastion" in argv.output
 
 
+def test_doctor_json_reports_failures_and_exits_nonzero(monkeypatch) -> None:
+    """doctor --json 既给结构化报告，又保留能直接 if 判断的退出码。"""
+    import json as _json
+
+    # _cfg() 的 identity_file 指向一个不存在的路径 → 必然有 FAIL。
+    monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
+    monkeypatch.setattr("ponte.main._daemon", lambda: _FakeDaemon(running=False))
+    result = CliRunner().invoke(app, ["doctor", "--offline", "--json"])
+
+    payload = _json.loads(result.output)
+    assert set(payload) == {"ok", "counts", "checks"}
+    assert payload["ok"] is False
+    assert payload["counts"]["fail"] >= 1
+    assert result.exit_code == 1
+    first = payload["checks"][0]
+    assert set(first) == {"name", "status", "detail", "hint"}
+    assert payload["counts"]["fail"] == sum(
+        1 for check in payload["checks"] if check["status"] == "fail"
+    )
+
+
+def test_shell_completion_script_is_available() -> None:
+    """add_completion=True：--show-completion 真的能生成补全脚本。"""
+    result = CliRunner().invoke(app, ["--show-completion", "bash"])
+    assert result.exit_code == 0
+    assert "completion" in result.output.lower()

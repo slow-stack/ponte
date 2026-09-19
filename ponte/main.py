@@ -73,7 +73,8 @@ app = typer.Typer(
     no_args_is_help=True,
     invoke_without_command=True,
     help="管理 SSH 反向隧道守护进程的命令行工具",
-    add_completion=False,
+    # 生成 shell 补全（bash/zsh/fish/PowerShell）：ponte --install-completion
+    add_completion=True,
 )
 console = Console()
 err_console = Console(stderr=True)
@@ -832,6 +833,9 @@ def check(
 def doctor(
     offline: bool = typer.Option(False, "--offline", help="跳过需要网络/SSH 的检查"),
     timeout: int = typer.Option(5, "--timeout", help="SSH 连通性测试超时（秒）"),
+    json_output: bool = typer.Option(
+        False, "--json", help="以 JSON 输出体检结果（供脚本 / CI 消费）"
+    ),
 ) -> None:
     """一键体检：配置、密钥、连通性、端口、自启与通知，逐项给结论与修法。"""
     try:
@@ -849,6 +853,33 @@ def doctor(
         daemon = None
 
     checks = run_checks(cfg, daemon, offline=offline, timeout=timeout)
+    tally = counts(checks)
+
+    if json_output:
+        # 与表格同一份结论，只是给脚本一个稳定的结构；退出码照样反映失败，
+        # 这样 CI 里既能把报告存下来，又可以直接用 if 判断。
+        console.print_json(
+            json.dumps(
+                {
+                    "ok": tally[FAIL] == 0,
+                    "counts": tally,
+                    "checks": [
+                        {
+                            "name": check.name,
+                            "status": check.status,
+                            "detail": check.detail,
+                            "hint": check.hint,
+                        }
+                        for check in checks
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+        if tally[FAIL]:
+            raise typer.Exit(code=1)
+        return
+
     table = Table(title="ponte doctor", header_style="bold cyan")
     table.add_column("检查", no_wrap=True, style="cyan")
     table.add_column("结论", no_wrap=True)
@@ -869,7 +900,6 @@ def doctor(
         )
     console.print(table)
 
-    tally = counts(checks)
     console.print(
         f"通过 {tally[OK]} · 注意 {tally[WARN]} · "
         f"失败 {tally[FAIL]} · 跳过 {tally[SKIP]}"
