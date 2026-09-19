@@ -40,6 +40,10 @@ class _TM:
     def build_args(self): ...
 pkg3.TunnelManager = _TM
 
+class ProbeError(RuntimeError):
+    """探针没跑成 → 状态未知（stub：名字必须与 ponte.core 保持同步）。"""
+pkg3.ProbeError = ProbeError
+
 sys.modules["ponte"] = pkg
 sys.modules["ponte.config"] = pkg2
 sys.modules["ponte.core"] = pkg3
@@ -143,15 +147,17 @@ class Proc:
     def poll(self): return None if self.alive else 1
 
 class TM2:
-    def __init__(self, alive=True, ports="dict", fail_ports=False):
+    def __init__(self, alive=True, ports="dict", fail_ports=False, probe_error=None):
         self._proc = Proc(alive)
         self.ports = ports
         self.fail_ports = fail_ports
+        self.probe_error = probe_error
         self._timeout = None
     @property
     def process(self): return self._proc
     def check_remote_ports(self, **kw):
         self._timeout = kw.get("timeout")
+        if self.probe_error is not None: raise ProbeError(self.probe_error)
         if self.fail_ports: raise ConnectionError("refused")
         if self.ports == "dict": return {23334: True, 17897: False}
         if self.ports == "list": return [23334, 17897]
@@ -181,6 +187,14 @@ hc4 = health.HealthChecker(TM2(alive=True, ports="dict", fail_ports=True), _HC(6
 s4 = hc4.check()
 assert s4.all_healthy is False and s4.error is not None and "ConnectionError" in s4.error
 print("health: port check failure ->", s4.error)
+
+# 探测连接失败 = 未知：不得报成“端口未监听”，且必须可判定为“不确定”。
+hc6 = health.HealthChecker(TM2(probe_error="ssh 退出码 255"), _HC(60, True, 10))
+s6 = hc6.check()
+assert s6.remote_ports == {} and s6.all_healthy is False, s6
+assert s6.remote_probe_error and "255" in s6.remote_probe_error
+assert s6.conclusive is False and "unknown" in str(s6)
+print("health: unanswered probe is unknown OK ->", s6.remote_probe_error)
 
 hc5 = health.HealthChecker(TM2(alive=True, ports="bad"), _HC(60, False, 10))
 s5 = hc5.check()

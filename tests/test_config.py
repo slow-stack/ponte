@@ -11,7 +11,9 @@ from ponte.config import (
     ConfigNotFoundError,
     ConfigParseError,
     ConfigValidationError,
+    JumpHop,
     TunnelConfig,
+    daemon_paths_from_file,
     ensure_bindable,
     get_config,
     is_loopback_host,
@@ -1060,3 +1062,201 @@ def test_ensure_bindable_treats_an_empty_host_as_exposed() -> None:
     with pytest.raises(ConfigValidationError, match="token"):
         ensure_bindable("", "")
     ensure_bindable("", "s3cret")
+
+
+# ---------------------------------------------------------------------------
+# [ssh] —— 省略 user / identity_file 即复用 ~/.ssh/config
+# ---------------------------------------------------------------------------
+
+
+def test_ssh_host_only_defers_to_ssh_config(tmp_path) -> None:
+    """只写 host 必须能解析：user/identity_file 交给 ~/.ssh/config 与 ssh-agent。"""
+    body = """
+[ssh]
+host = "myserver"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+"""
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.ssh.host == "myserver"
+    assert cfg.ssh.user == ""
+    assert cfg.ssh.identity_file is None
+    # 只有主机名，ssh 才能套用 Host 别名里的 User / IdentityFile
+    assert cfg.ssh.destination == "myserver"
+    assert cfg.ssh.port == 22
+
+
+# ---------------------------------------------------------------------------
+# [ssh] jump —— 经跳板机连接（ProxyJump / -J）
+# ---------------------------------------------------------------------------
+
+_JUMP_TUNNEL = """
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+"""
+
+
+def test_ssh_jump_single_hop(tmp_path) -> None:
+    """jump 解析成 hop，之后原样交给 ssh -J；目标侧不受影响。"""
+    body = '[ssh]\nhost = "10.0.0.9"\njump = "ops@bastion.example.com"\n' + _JUMP_TUNNEL
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.ssh.proxy_jump == "ops@bastion.example.com"
+    assert cfg.ssh.first_hop == JumpHop(host="bastion.example.com", user="ops")
+    assert cfg.ssh.destination == "10.0.0.9"
+
+
+def test_ssh_jump_accepts_the_openssh_spelling_and_port(tmp_path) -> None:
+    """proxy_jump 是同一个设置；host:port 写法保留端口（非 22 必须留在 -J 里）。"""
+    body = (
+        '[ssh]\nhost = "10.0.0.9"\nproxy_jump = "ops@bastion.example.com:2222"\n'
+        + _JUMP_TUNNEL
+    )
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.ssh.proxy_jump == "ops@bastion.example.com:2222"
+    assert cfg.ssh.first_hop is not None
+    assert cfg.ssh.first_hop.port == 2222
+
+
+def test_ssh_jump_chain_keeps_every_hop(tmp_path) -> None:
+    """多跳：逗号分隔，顺序保留，IPv6 字面量加回刮号。"""
+    body = (
+        '[ssh]\nhost = "10.0.0.9"\n'
+        'jump = "ops@hop1:2222, root@[::1], hop3"\n' + _JUMP_TUNNEL
+    )
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert [hop.render() for hop in cfg.ssh.jumps] == [
+        "ops@hop1:2222",
+        "root@[::1]",
+        "hop3",
+    ]
+    assert cfg.ssh.proxy_jump == "ops@hop1:2222,root@[::1],hop3"
+    # 本机只可能直连第一跳，doctor 探测的就是它
+    assert cfg.ssh.first_hop == JumpHop(host="hop1", user="ops", port=2222)
+
+
+def test_ssh_jump_absent_is_none(tmp_path) -> None:
+    """没写 jump 时为 None，且不会输出空的 -J。"""
+    body = '[ssh]\nhost = "example.com"\n' + _JUMP_TUNNEL
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.ssh.jumps == ()
+    assert cfg.ssh.proxy_jump is None
+    assert cfg.ssh.first_hop is None
+
+
+@pytest.mark.parametrize(
+    "jump",
+    [
+        "ops@",            # 有空 user 没 host
+        "bastion:",        # 冒号后没端口
+        "a,,b",            # 空 hop
+        "ops@bastion:0",   # 端口越界
+        "ops@bastion:70000",
+        "bastion example.com",
+    ],
+)
+def test_ssh_jump_rejects_bad_hop(tmp_path, jump: str) -> None:
+    body = f'[ssh]\nhost = "10.0.0.9"\njump = "{jump}"\n' + _JUMP_TUNNEL
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_ssh_jump_rejects_both_spellings(tmp_path) -> None:
+    """两种写法同时出现是有歧义的，不能猜。"""
+    body = (
+        '[ssh]\nhost = "10.0.0.9"\n'
+        'jump = "hop1"\nproxy_jump = "hop2"\n' + _JUMP_TUNNEL
+    )
+    with pytest.raises(ConfigValidationError, match="keep one"):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_ssh_jump_rejects_conflicting_options(tmp_path) -> None:
+    """jump 与 [ssh.options] ProxyJump/ProxyCommand 说的是同一件事，直接拒绝。"""
+    body = (
+        '[ssh]\nhost = "10.0.0.9"\njump = "bastion"\n'
+        '[ssh.options]\nProxyJump = "other"\n' + _JUMP_TUNNEL
+    )
+    with pytest.raises(ConfigValidationError, match="ProxyJump"):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_ssh_jump_works_inside_a_profile(tmp_path) -> None:
+    """profiles 布局里同样可用，而每个 profile 各有自己的跳板机。"""
+    body = (
+        '[[profiles]]\nname = "web"\n'
+        '[profiles.ssh]\nhost = "10.0.0.9"\njump = "bastion"\n'
+        '[[profiles.tunnels]]\nremote_port = 23334\n'
+        'local_host = "localhost"\nlocal_port = 2222\n'
+    )
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.profiles[0].ssh.proxy_jump == "bastion"
+
+
+def test_jumphop_render_and_destination() -> None:
+    """render() 是给 ssh 看的：省略默认端口、给 IPv6 加刮号。"""
+    assert JumpHop(host="bastion", user="ops").render() == "ops@bastion"
+    assert JumpHop(host="bastion", user="ops").destination == "ops@bastion"
+    assert JumpHop(host="bastion").render() == "bastion"
+    assert JumpHop(host="bastion", port=2200).render() == "bastion:2200"
+    assert JumpHop(host="::1", user="root", port=2200).render() == "root@[::1]:2200"
+
+
+def test_ssh_user_without_identity_file(tmp_path) -> None:
+    """写了 user 但不写 identity_file：目标带 user@，密钥仍由 ssh 解析。"""
+    body = """
+[ssh]
+host = "myserver"
+user = "deploy"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+"""
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.ssh.destination == "deploy@myserver"
+    assert cfg.ssh.identity_file is None
+
+
+# ---------------------------------------------------------------------------
+# daemon_paths_from_file —— 配置坏掉时控制命令的兼底
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_paths_from_file_recovers_a_config_that_fails_validation(tmp_path) -> None:
+    """严格加载失败（缺隧道）仍要能取回 [daemon] 的 pid/log，否则 stop 被锁死。"""
+    pid = tmp_path / "custom.pid"
+    log = tmp_path / "custom.log"
+    body = (
+        "[daemon]\n"
+        f'pid_file = "{pid.as_posix()}"\n'
+        f'log_file = "{log.as_posix()}"\n'
+        '\n[ssh]\nhost = "example.com"\n'
+    )
+    path = _write_toml(tmp_path, body)
+
+    with pytest.raises(ConfigValidationError):
+        load_config(path)
+
+    assert daemon_paths_from_file(path) == (pid.as_posix(), log.as_posix())
+
+
+def test_daemon_paths_from_file_falls_back_when_toml_is_broken(tmp_path) -> None:
+    """连 TOML 都不合法时退回平台默认路径，而不是把异常抛给 stop。"""
+    pid_file, log_file = daemon_paths_from_file(
+        _write_toml(tmp_path, "not = toml = =\n")
+    )
+    assert os.path.isabs(pid_file) and os.path.basename(pid_file) == "ponte.pid"
+    assert os.path.isabs(log_file) and os.path.basename(log_file) == "ponte.log"
+
+
+def test_daemon_paths_from_file_falls_back_when_the_file_is_missing(tmp_path) -> None:
+    """配置文件被删掉也一样：返回默认路径，不报错。"""
+    pid_file, log_file = daemon_paths_from_file(tmp_path / "nope.toml")
+    assert os.path.isabs(pid_file) and os.path.basename(pid_file) == "ponte.pid"
+    assert os.path.isabs(log_file) and os.path.basename(log_file) == "ponte.log"

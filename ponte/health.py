@@ -9,14 +9,17 @@ log a warning, or leave the retry loop to handle it.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import threading
 import time
 from collections.abc import Callable
 
 from ponte.config import HealthConfig
-from ponte.core import TunnelManager
+from ponte.core import ProbeError, TunnelManager
 
 __all__ = ["HealthChecker", "HealthStatus"]
+
+logger = logging.getLogger(__name__)
 
 #: Type of a user-supplied run-loop callback: ``Callable[[HealthStatus], None]``.
 HealthCallback = Callable[["HealthStatus"], None]
@@ -40,9 +43,16 @@ class HealthStatus:
             ``-L``/``-D`` listeners probed on this machine.
         all_healthy: Overall health — the process is alive, every checked
             remote *and* local port is listening, and the check did not error.
+            Note that ``all_healthy is False`` does **not** by itself mean the
+            tunnel is down: a check that could not be completed is also not
+            healthy (see ``conclusive``).
         timestamp: Unix time (``time.time()``) when the check was performed.
         error: Human-readable error message if the check partially failed,
             else ``None``.
+        remote_probe_error: Set when the *server-side* probe connection itself
+            failed, so the ``-R`` ports could not be observed at all. Their
+            state is then unknown — ``remote_ports`` stays empty rather than
+            claiming every port is closed.
     """
 
     process_alive: bool
@@ -51,20 +61,47 @@ class HealthStatus:
     timestamp: float
     error: str | None = None
     local_ports: dict[int, bool] = dataclasses.field(default_factory=dict)
+    remote_probe_error: str | None = None
+
+    @property
+    def conclusive(self) -> bool:
+        """Whether this snapshot is a verdict about the tunnel at all.
+
+        A dead SSH process, or a port that a probe *did* reach and found
+        closed, is a verdict. A probe that never ran is not: it says the
+        inspector failed, not the tunnel. Callers use this to keep the two
+        apart — only a conclusive unhealthy reading may escalate (the daemon
+        force-reconnects after ``_HEALTH_FAILURE_THRESHOLD`` of them), because
+        a probe connection fails for reasons that leave the tunnel untouched.
+        """
+        if not self.process_alive:
+            return True
+        return self.error is None and self.remote_probe_error is None
 
     def __str__(self) -> str:  # human-friendly one-liner for logs
-        ports = {
-            port: ("ok" if ok else "down") for port, ok in self.remote_ports.items()
-        }
+        remote: object
+        if self.remote_probe_error is not None:
+            remote = "unknown"
+        else:
+            remote = {
+                port: ("ok" if ok else "down")
+                for port, ok in self.remote_ports.items()
+            }
         local = {
             port: ("ok" if ok else "down") for port, ok in self.local_ports.items()
         }
         return (
             f"process={'alive' if self.process_alive else 'dead'}, "
-            f"remote_ports={ports}, "
+            f"remote_ports={remote}, "
             f"local_ports={local},"
             f" healthy={self.all_healthy}"
+            + ("" if self.conclusive else ", conclusive=False")
             + (f", error={self.error!r}" if self.error else "")
+            + (
+                f", probe_error={self.remote_probe_error!r}"
+                if self.remote_probe_error
+                else ""
+            )
         )
 
 
@@ -115,9 +152,16 @@ class HealthChecker:
 
         # 2. Are the remote forwarding ports listening?
         remote_ports: dict[int, bool] = {}
+        remote_probe_error: str | None = None
         if self.remote_check_enabled:
             try:
                 remote_ports = self.check_remote_ports()
+            except ProbeError as exc:
+                # The probe never ran. The ports are *unknown*, not down:
+                # leaving them out entirely means no display layer can turn a
+                # failed probe connection into "未监听".
+                remote_probe_error = str(exc)
+                logger.debug("remote port probe could not run: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 error_messages.append(
                     f"remote port check failed: {type(exc).__name__}: {exc}"
@@ -136,12 +180,13 @@ class HealthChecker:
                 f"local port check failed: {type(exc).__name__}: {exc}"
             )
 
-        # 4. Aggregate. An error on any sub-check makes the result unhealthy —
-        # a failed probe is indistinguishable from a down tunnel, so be
-        # conservative.
+        # 4. Aggregate. An unexpected error on any sub-check makes the result
+        # unhealthy — not healthy is the safe default — but it is *not* a
+        # verdict, so callers must read ``conclusive`` before escalating.
         error = "; ".join(error_messages) if error_messages else None
         all_healthy = (
             error is None
+            and remote_probe_error is None
             and process_alive
             and all(remote_ports.values())
             and all(local_ports.values())
@@ -153,6 +198,7 @@ class HealthChecker:
             timestamp=snapshot_time,
             error=error,
             local_ports=local_ports,
+            remote_probe_error=remote_probe_error,
         )
 
     def check_remote_ports(self) -> dict[int, bool]:
@@ -160,7 +206,9 @@ class HealthChecker:
 
         Returns a ``{port: bool}`` mapping of which configured remote ports are
         listening. Tolerates both a ``dict[int, bool]`` and a simple iterable of
-        open ports as return values.
+        open ports as return values. A :class:`~ponte.core.ProbeError` from the
+        manager propagates untouched: it means the probe connection failed and
+        the ports were never observed.
         """
         method = getattr(self.manager, "check_remote_ports", None)
         if not callable(method):
@@ -236,7 +284,10 @@ class HealthChecker:
         Every remote-port check opens a new SSH connection, so a prolonged
         outage must not hammer the server hard enough to trip ``MaxStartups``.
         The interval returns to the base ``interval`` as soon as a check is
-        healthy again.
+        healthy again. An inconclusive check (a probe connection that failed)
+        counts as "not healthy" here on purpose: backing off is exactly what a
+        rate-limiting path wants, even though the daemon will not treat it as
+        evidence that the tunnel is down.
         """
         if interval is None:
             interval = self.check_interval

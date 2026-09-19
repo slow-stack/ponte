@@ -102,6 +102,53 @@ def _profiles(payload: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     }
 
 
+def _health_detail(section: Mapping[str, Any]) -> str | None:
+    """The reason attached to a profile's health mark, if any.
+
+    ``probe_error`` is listed as well as ``health_error`` because a failed
+    probe reports itself separately — that is what makes "we could not ask"
+    distinguishable from "we asked and the answer was no".
+    """
+    return section.get("health_error") or section.get("probe_error") or None
+
+
+def _failure_reason(section: Mapping[str, Any]) -> str | None:
+    """Why a profile is unhealthy, when the daemon recorded no reason of its own.
+
+    A conclusive failure often carries no error string: the probe ran fine and
+    simply found a port closed, so the reason has to be read back out of the
+    observed port states. Without this, ``/healthz`` answers ``503 degraded``
+    and leaves the reader with nothing to act on.
+    """
+    detail = _health_detail(section)
+    if detail:
+        return detail
+    if section.get("process_alive") is False:
+        return "SSH process is not running"
+    reasons: list[str] = []
+    for key, kind in (("remote_ports", "remote"), ("local_ports", "local")):
+        ports = section.get(key)
+        if not isinstance(ports, Mapping):
+            continue
+        for port, listening in sorted(ports.items(), key=lambda item: str(item[0])):
+            if listening is False:
+                label = "port" if kind == "remote" else "local port"
+                reasons.append(f"{label} {port} is not listening")
+    return "; ".join(reasons) or None
+
+
+def _inconclusive(section: Mapping[str, Any]) -> bool:
+    """Whether a profile's last check failed to reach a verdict.
+
+    The daemon marks this explicitly (``health_conclusive``): ``healthy`` is
+    False either way, but only a *conclusive* failure is evidence that the
+    tunnel is broken. A shared/NATed uplink drops the probe's own connection
+    often enough that reporting every such tick as degraded turns a monitoring
+    endpoint into noise nobody reads.
+    """
+    return section.get("healthy") is False and section.get("health_conclusive") is False
+
+
 def _as_float(value: Any, default: float | None = None) -> float | None:
     """Coerce a JSON number, returning *default* for anything else."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -128,10 +175,14 @@ def health_response(payload: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
     The code reports whether the tunnel works, which is the whole reason to
     have this endpoint instead of pinging the PID file:
 
-    * ``503 down``     — the daemon is not running: nothing is being forwarded.
-    * ``503 degraded`` — running, but at least one profile is unhealthy.
-    * ``200 ok``       — running, and every profile is healthy.
-    * ``200 starting`` — running, but no health check has reported yet. A fresh
+    * ``503 down``       — the daemon is not running: nothing is being forwarded.
+    * ``503 degraded``   — running, but at least one profile conclusively failed.
+    * ``200 unverified`` — running, but every recent check failed to reach a
+      verdict: the probe's own connection could not be made, so the state is
+      unknown rather than broken. Kept out of ``degraded`` on purpose — a
+      flaky path to the server would otherwise page on every restart.
+    * ``200 ok``         — running, and every profile is healthy.
+    * ``200 starting``   — running, but no health check has reported yet. A fresh
       ``ponte start`` waits up to ``check_interval`` (60 s by default) for its
       first answer; calling that "down" would fire a false alert on every
       restart, and "no data yet" is not evidence of failure.
@@ -143,20 +194,35 @@ def health_response(payload: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
     if not profiles:
         return 200, {"status": "starting", "reason": "no profile has reported yet"}
 
+    unknown = sorted(name for name, s in profiles.items() if _inconclusive(s))
     unhealthy = sorted(
-        name for name, section in profiles.items() if section.get("healthy") is False
+        name
+        for name, section in profiles.items()
+        if section.get("healthy") is False and not _inconclusive(section)
     )
     if unhealthy:
-        errors = {
-            name: profiles[name].get("health_error")
-            for name in unhealthy
-            if profiles[name].get("health_error")
-        }
-        return 503, {
+        errors: dict[str, Any] = {}
+        for name in unhealthy:
+            detail = _failure_reason(profiles[name])
+            if detail:
+                errors[name] = detail
+        body: dict[str, Any] = {
             "status": "degraded",
             "profiles": len(profiles),
             "unhealthy": unhealthy,
             "errors": errors,
+        }
+        if unknown:
+            body["unknown"] = unknown
+        return 503, body
+
+    if unknown:
+        return 200, {
+            "status": "unverified",
+            "profiles": len(profiles),
+            "unknown": unknown,
+            "reason": "health checks could not be completed; the tunnel state "
+            "is unknown, not broken",
         }
 
     if all(section.get("healthy") is True for section in profiles.values()):
@@ -294,7 +360,7 @@ def render_metrics(payload: Mapping[str, Any], *, now: float | None = None) -> s
     families.add(
         "ponte_profiles_unhealthy",
         "gauge",
-        "Profiles that are currently unhealthy.",
+        "Profiles that conclusively failed their last health check.",
         [
             _series(
                 "ponte_profiles_unhealthy",
@@ -303,7 +369,21 @@ def render_metrics(payload: Mapping[str, Any], *, now: float | None = None) -> s
                     1
                     for section in profiles.values()
                     if section.get("healthy") is False
+                    and not _inconclusive(section)
                 ),
+            )
+        ],
+    )
+    families.add(
+        "ponte_profiles_unknown",
+        "gauge",
+        "Profiles whose last health check could not be completed "
+        "(unknown state, not necessarily broken).",
+        [
+            _series(
+                "ponte_profiles_unknown",
+                {},
+                sum(1 for section in profiles.values() if _inconclusive(section)),
             )
         ],
     )
@@ -344,8 +424,10 @@ def render_metrics(payload: Mapping[str, Any], *, now: float | None = None) -> s
     add(
         "ponte_profile_healthy",
         "gauge",
-        "1 when every health check of the profile passes; absent until the first check.",
-        lambda section: section.get("healthy"),
+        "1 when every health check of the profile passes; absent until the first "
+        "check, and absent while a check cannot be completed (see "
+        "ponte_profiles_unknown) — an unanswered probe is not a failed tunnel.",
+        lambda section: None if _inconclusive(section) else section.get("healthy"),
     )
     add(
         "ponte_profile_process_alive",
@@ -541,6 +623,8 @@ def _health_pill(section: Mapping[str, Any]) -> str:
     if healthy is True:
         return _pill("健康", "ok")
     if healthy is False:
+        if _inconclusive(section):
+            return _pill("未知", "unknown")
         return _pill("异常", "bad")
     return _pill("未知", "unknown")
 
@@ -609,7 +693,12 @@ def _feed(section: Mapping[str, Any]) -> str:
 def _profile_card(name: str, section: Mapping[str, Any], *, now: float) -> str:
     """One profile's card: identity, statistics, ports and event feed."""
     healthy = section.get("healthy")
-    tone = "ok" if healthy is True else ("bad" if healthy is False else "unknown")
+    if healthy is True:
+        tone = "ok"
+    elif healthy is False and not _inconclusive(section):
+        tone = "bad"
+    else:
+        tone = "unknown"
     rows: list[str] = []
 
     if section.get("destination"):
@@ -670,6 +759,9 @@ def _profile_card(name: str, section: Mapping[str, Any], *, now: float) -> str:
     if notified is not None:
         rows.append(_row("上次通知", f"{_format_duration(now - notified)}前"))
 
+    if section.get("probe_error"):
+        rows.append(_row("探测失败（端口状态未知）", section["probe_error"]))
+
     if section.get("health_error"):
         rows.append(_row("检查错误", section["health_error"]))
     if section.get("error"):
@@ -689,10 +781,17 @@ def _summary(payload: Mapping[str, Any], profiles: Mapping[str, Any]) -> str:
     if not payload.get("running"):
         return _pill("守护进程未运行", "bad") + '<span class="muted">可执行 ponte start 启动</span>'
     unhealthy = [
-        name for name, section in profiles.items() if section.get("healthy") is False
+        name
+        for name, section in profiles.items()
+        if section.get("healthy") is False and not _inconclusive(section)
     ]
+    unknown = [name for name, section in profiles.items() if _inconclusive(section)]
     if unhealthy:
         overall = _pill(f"{len(unhealthy)}/{len(profiles)} 条隧道异常", "bad")
+        if unknown:
+            overall += _pill(f"{len(unknown)} 条状态未知", "unknown")
+    elif unknown:
+        overall = _pill(f"{len(unknown)}/{len(profiles)} 条隧道状态未知", "unknown")
     elif profiles and all(
         section.get("healthy") is True for section in profiles.values()
     ):

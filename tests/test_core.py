@@ -1,16 +1,20 @@
 """pytest tests for :mod:`ponte.core` (SSH arg building + port probe parsing).
 
-No real SSH is spawned: ``subprocess.run`` is patched and the probe/connect
-command parsing is exercised directly.
+No real SSH is spawned: ``_run_capture`` (or ``Popen`` underneath it) is patched
+and the probe/connect command parsing is exercised directly.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 import sys
 import time
 
+import pytest
+
 from ponte.config import (
+    JumpHop,
     Profile,
     SSHConfig,
     SSHOptions,
@@ -18,7 +22,13 @@ from ponte.config import (
     TunnelConfig,
     WindowsConfig,
 )
-from ponte.core import TunnelManager, _find_ssh, creation_flags
+from ponte.core import (
+    ProbeError,
+    TunnelManager,
+    _find_ssh,
+    _run_capture,
+    creation_flags,
+)
 
 # ``CREATE_NO_WINDOW`` is a Windows-only constant missing from ``subprocess``
 # on POSIX. Referencing it directly would make the Windows-flag tests fail at
@@ -99,29 +109,20 @@ def test_find_ssh_windows_config(monkeypatch) -> None:
 
 
 def test_test_connection_ok(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "ponte.core.subprocess.run",
-        lambda *a, **k: __import__("types").SimpleNamespace(returncode=0, stdout="OK"),
-    )
+    monkeypatch.setattr("ponte.core._run_capture", lambda *a, **k: (0, "OK"))
     tm = TunnelManager(_cfg())
     assert tm.test_connection(timeout=5) is True
 
 
 def test_test_connection_fail(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "ponte.core.subprocess.run",
-        lambda *a, **k: __import__("types").SimpleNamespace(returncode=1, stdout=""),
-    )
+    monkeypatch.setattr("ponte.core._run_capture", lambda *a, **k: (1, ""))
     tm = TunnelManager(_cfg())
     assert tm.test_connection(timeout=5) is False
 
 
 def test_check_remote_ports_python_probe(monkeypatch) -> None:
     # 服务器端 python3 分支：输出空格分隔的开放端口
-    monkeypatch.setattr(
-        "ponte.core.subprocess.run",
-        lambda *a, **k: __import__("types").SimpleNamespace(returncode=0, stdout="23334\n"),
-    )
+    monkeypatch.setattr("ponte.core._run_capture", lambda *a, **k: (0, "23334\n"))
     tm = TunnelManager(_cfg())
     assert tm.check_remote_ports(timeout=5) == {23334: True, 17897: False}
 
@@ -129,23 +130,117 @@ def test_check_remote_ports_python_probe(monkeypatch) -> None:
 def test_check_remote_ports_tool_fallback(monkeypatch) -> None:
     # 回退分支：ss 风格输出 ``*:23334 `` token
     monkeypatch.setattr(
-        "ponte.core.subprocess.run",
-        lambda *a, **k: __import__("types").SimpleNamespace(
-            returncode=0,
-            stdout="tcp LISTEN 0 128 0.0.0.0:23334 users:(())\n",
-        ),
+        "ponte.core._run_capture",
+        lambda *a, **k: (0, "tcp LISTEN 0 128 0.0.0.0:23334 users:(())\n"),
     )
     tm = TunnelManager(_cfg())
     assert tm.check_remote_ports(timeout=5) == {23334: True, 17897: False}
 
 
-def test_check_remote_ports_error(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "ponte.core.subprocess.run",
-        lambda *a, **k: (_ for _ in ()).throw(subprocess.SubprocessError("boom")),
-    )
+def test_check_remote_ports_error_is_unknown_not_down(monkeypatch) -> None:
+    """探针自己建不起来 → 状态未知，绝不能报成“端口未监听”。
+
+    这条区别就是“没问到”和“问了、答案是没在听”的区别：把前者报成后者，
+    健康监视器连续几次就会把一条完全正常的隧道强行重连。
+    """
+
+    def _boom(*_args, **_kwargs):
+        raise subprocess.SubprocessError("boom")
+
+    monkeypatch.setattr("ponte.core._run_capture", _boom)
     tm = TunnelManager(_cfg())
-    assert tm.check_remote_ports(timeout=5) == {23334: False, 17897: False}
+    with pytest.raises(ProbeError) as excinfo:
+        tm.check_remote_ports(timeout=5)
+    assert "23334" in str(excinfo.value) and "未知" in str(excinfo.value)
+
+
+def test_check_remote_ports_nonzero_exit_is_unknown(monkeypatch) -> None:
+    """ssh 以非 0 退出（认证失败/被重置/被限速/被超时 kill）→ 检查命令压根没跑。"""
+    monkeypatch.setattr("ponte.core._run_capture", lambda *a, **k: (255, ""))
+    with pytest.raises(ProbeError) as excinfo:
+        TunnelManager(_cfg()).check_remote_ports(timeout=5)
+    assert "255" in str(excinfo.value)
+
+
+def test_check_remote_ports_wedged_pipe_is_unknown(monkeypatch) -> None:
+    """``_run_capture`` 放弃读取时返回 ``(None, "")`` —— 同样只能算未知。"""
+    monkeypatch.setattr("ponte.core._run_capture", lambda *a, **k: (None, ""))
+    with pytest.raises(ProbeError):
+        TunnelManager(_cfg()).check_remote_ports(timeout=5)
+
+
+def test_check_remote_ports_probe_that_ran_may_still_report_closed(monkeypatch) -> None:
+    """探针跑通了、输出里没有这个端口 → 这才是真正的“未监听”（可据以告警）。"""
+    monkeypatch.setattr("ponte.core._run_capture", lambda *a, **k: (0, "23334\n"))
+    assert TunnelManager(_cfg()).check_remote_ports(timeout=5) == {
+        23334: True,
+        17897: False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# _run_capture —— 探针读取必须永远有界
+# ---------------------------------------------------------------------------
+
+
+def _fake_popen(monkeypatch, *, stdout: str = "", returncode: int = 0,
+                timeouts: int = 0, captured: dict | None = None):
+    """Patch ``Popen`` with a probe stand-in; *timeouts* is how many
+    ``communicate`` calls raise :class:`subprocess.TimeoutExpired` first."""
+    state = {"timeouts": timeouts, "killed": False}
+
+    class _Proc:
+        def __init__(self) -> None:
+            self.returncode = returncode
+
+        def communicate(self, timeout=None):
+            if state["timeouts"] > 0:
+                state["timeouts"] -= 1
+                raise subprocess.TimeoutExpired(cmd="ssh", timeout=timeout)
+            return stdout, ""
+
+        def kill(self) -> None:
+            state["killed"] = True
+
+    def _popen(args, **kwargs):
+        if captured is not None:
+            captured["args"] = args
+            captured.update(kwargs)
+        return _Proc()
+
+    monkeypatch.setattr("ponte.core.subprocess.Popen", _popen)
+    return state
+
+
+def test_run_capture_returns_stdout(monkeypatch) -> None:
+    _fake_popen(monkeypatch, stdout="23334\n", returncode=0)
+    assert _run_capture(["ssh", "host"], timeout=5) == (0, "23334\n")
+
+
+def test_run_capture_never_inherits_handles(monkeypatch) -> None:
+    """探针不得继承/泄漏句柄：stdin 丢弃、close_fds 打开。
+
+    继承来的管道写端会让 ``communicate()`` 永远等不到 EOF，这正是健康监视器
+    卡死数小时的成因。
+    """
+    captured: dict = {}
+    _fake_popen(monkeypatch, captured=captured)
+    _run_capture(["ssh", "host"], timeout=5)
+    assert captured["close_fds"] is True
+    assert captured["stdin"] is subprocess.DEVNULL
+
+
+def test_run_capture_hangs_up_after_killing_a_wedged_probe(monkeypatch) -> None:
+    """超时被 kill 后若管道仍不关闭，必须放弃输出而不是永远阻塞调用方。"""
+    state = _fake_popen(monkeypatch, timeouts=2)
+    assert _run_capture(["ssh", "host"], timeout=0.1) == (None, "")
+    assert state["killed"] is True
+
+
+def test_run_capture_keeps_output_when_the_killed_probe_still_reports(monkeypatch) -> None:
+    """超时后能读到的输出仍然有用（例如 ssh 已经把端口列表写出来了）。"""
+    _fake_popen(monkeypatch, stdout="23334", returncode=255, timeouts=1)
+    assert _run_capture(["ssh", "host"], timeout=0.1) == (255, "23334")
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +301,7 @@ def test_check_remote_ports_skips_non_remote_kinds(monkeypatch) -> None:
     monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
     calls: list[tuple] = []
     monkeypatch.setattr(
-        "ponte.core.subprocess.run", lambda *a, **k: calls.append(a)
+        "ponte.core._run_capture", lambda args, **k: calls.append(args)
     )
     tm = TunnelManager(
         _cfg(
@@ -391,23 +486,92 @@ def test_connect_passes_creationflags(monkeypatch) -> None:
             return self.returncode
 
     def _popen(*args, **kwargs):
-        captured["creationflags"] = kwargs.get("creationflags")
+        captured.update(kwargs)
         return _Proc()
 
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr("ponte.core.subprocess.Popen", _popen)
     TunnelManager(_cfg()).connect()
     assert captured["creationflags"] == _CREATE_NO_WINDOW_VALUE
+    # 长命 ssh 绝不能继承兄弟进程的管道：Windows 没有 close-on-exec，
+    # 被继承的写端会让持有读端的一方永远等不到 EOF。
+    assert captured["close_fds"] is True
 
 
 def test_test_connection_passes_creationflags(monkeypatch) -> None:
     captured: dict = {}
-
-    def _run(*args, **kwargs):
-        captured["creationflags"] = kwargs.get("creationflags")
-        return __import__("types").SimpleNamespace(returncode=0, stdout="OK")
+    _fake_popen(monkeypatch, stdout="OK", returncode=0, captured=captured)
 
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr("ponte.core.subprocess.run", _run)
-    TunnelManager(_cfg()).test_connection()
+    assert TunnelManager(_cfg()).test_connection() is True
     assert captured["creationflags"] == _CREATE_NO_WINDOW_VALUE
+
+
+# ---------------------------------------------------------------------------
+# [ssh] jump —— -J 必须出现在每一条通往服务器的命令里
+# ---------------------------------------------------------------------------
+
+_JUMP_HOPS = (JumpHop(host="bastion.example.com", user="ops"),)
+
+
+def _jump_cfg() -> TunnelConfig:
+    """单一 profile，服务器只能从跳板机那一侧访问。"""
+    cfg = _cfg()
+    profile = dataclasses.replace(
+        cfg.profiles[0],
+        ssh=dataclasses.replace(cfg.profiles[0].ssh, jumps=_JUMP_HOPS),
+    )
+    return dataclasses.replace(cfg, profiles=[profile])
+
+
+def test_build_args_passes_the_jump_host_to_ssh(monkeypatch) -> None:
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    args = TunnelManager(_jump_cfg()).build_args()
+    assert _flag_pairs(args, "-J") == [("-J", "ops@bastion.example.com")]
+    # 隧道仍然指向真正的服务器，跳板机只用来过路
+    assert args[-1] == "testuser@example.com"
+
+
+def test_the_login_test_goes_through_the_jump_host(monkeypatch) -> None:
+    """健康检查/ponte test 必须走同一条链路，否则隧道通了却报“登录失败”。"""
+    captured: dict = {}
+
+    def _run(args, **_kwargs):
+        captured["args"] = args
+        return 0, "OK"
+
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    monkeypatch.setattr("ponte.core._run_capture", _run)
+    assert TunnelManager(_jump_cfg()).test_connection(timeout=7) is True
+    assert _flag_pairs(captured["args"], "-J") == [("-J", "ops@bastion.example.com")]
+    assert captured["args"][-2:] == ["testuser@example.com", "echo OK"]
+    assert ("-o", "ConnectTimeout=7") in _flag_pairs(captured["args"], "-o")
+
+
+def test_the_remote_port_probe_goes_through_the_jump_host(monkeypatch) -> None:
+    """服务端端口探测也要过跳板机，否则它连不上服务器、把健康的隧道报成异常。"""
+    captured: dict = {}
+
+    def _run(args, **_kwargs):
+        captured["args"] = args
+        return 0, "23334"
+
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    monkeypatch.setattr("ponte.core._run_capture", _run)
+    assert TunnelManager(_jump_cfg()).check_remote_ports(timeout=7)[23334] is True
+    assert _flag_pairs(captured["args"], "-J") == [("-J", "ops@bastion.example.com")]
+
+
+def test_build_args_without_key_or_user_defers_to_ssh(monkeypatch) -> None:
+    """没有 identity_file / user 时不传 -i、也不拼 user@，交给 ssh 自己解析。"""
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    cfg = _cfg()
+    profile = dataclasses.replace(
+        cfg.profiles[0],
+        ssh=dataclasses.replace(cfg.profiles[0].ssh, identity_file=None, user=""),
+    )
+    tm = TunnelManager(dataclasses.replace(cfg, profiles=[profile]))
+    args = tm.build_args()
+    assert "-i" not in args
+    assert args[-1] == "example.com"
+    assert "-p" not in args

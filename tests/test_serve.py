@@ -39,6 +39,8 @@ def _profile(**overrides) -> dict:
         "healthy": True,
         "process_alive": True,
         "health_error": None,
+        "health_conclusive": True,
+        "probe_error": None,
         "error": None,
         "remote_ports": {"23334": True},
         "local_ports": {"1080": False},
@@ -176,6 +178,101 @@ def test_healthz_degraded_names_the_broken_profile() -> None:
     assert body["status"] == "degraded"
     assert body["unhealthy"] == ["db"]
     assert body["errors"] == {"db": "port 23335 is not listening"}
+
+
+# ---------------------------------------------------------------------------
+# 探测没跑成 ≠ 隧道挂了
+# ---------------------------------------------------------------------------
+
+
+def _unanswered(**overrides) -> dict:
+    """一份“本次检查没有得出结论”的 section（守护进程写出来的样子）。"""
+    return _profile(
+        healthy=False,
+        health_conclusive=False,
+        probe_error="探测连接失败（ssh 退出码 255）：23334 的状态未知",
+        remote_ports={},
+        **overrides,
+    )
+
+
+def test_healthz_unverified_is_not_degraded() -> None:
+    """探针自己建不起来 → 200 unverified，而不是 503 degraded。
+
+    否则一条共享/NAT 出口（探测连接失败率实测约 30%）会把监控变成噪声。
+    """
+    code, body = health_response(_payload(profiles={"web": _unanswered()}))
+    assert code == 200
+    assert body["status"] == "unverified"
+    assert body["unknown"] == ["web"]
+    assert "unhealthy" not in body
+
+
+def test_healthz_degraded_still_wins_and_names_the_unknown_ones() -> None:
+    """确凿失败优先：一个真坏 + 一个未知 → 503，且两者都点出来。"""
+    code, body = health_response(
+        _payload(
+            profiles={
+                "web": _unanswered(),
+                "db": _profile(healthy=False, health_error="port 23335 is not listening"),
+            }
+        )
+    )
+    assert code == 503
+    assert body["unhealthy"] == ["db"]
+    assert body["unknown"] == ["web"]
+    assert body["errors"] == {"db": "port 23335 is not listening"}
+
+
+def test_metrics_do_not_call_an_unanswered_probe_a_failure() -> None:
+    """``ponte_profile_healthy`` 在未知时“缺样本”，而不是报 0。"""
+    families = _parse_families(
+        render_metrics(
+            _payload(profiles={"web": _unanswered(), "db": _profile()}), now=_NOW
+        )
+    )
+    assert _sample(families, "ponte_profile_healthy", profile="web") is None
+    assert _sample(families, "ponte_profile_healthy", profile="db") == (
+        'ponte_profile_healthy{profile="db"} 1'
+    )
+    assert _sample(families, "ponte_profiles_unhealthy") == "ponte_profiles_unhealthy 0"
+    assert _sample(families, "ponte_profiles_unknown") == "ponte_profiles_unknown 1"
+
+
+def test_dashboard_shows_unknown_with_its_reason() -> None:
+    """看板卡片必须是“未知”，不能是红色“异常”。"""
+    page = dashboard_html(_payload(profiles={"web": _unanswered()}), now=_NOW)
+    assert "未知" in page
+    assert "异常" not in page
+    assert "探测失败（端口状态未知）" in page
+    assert 'class="card unknown"' in page
+
+
+def test_healthz_degraded_explains_a_closed_port_without_an_error_string() -> None:
+    """探针跑通了、看到端口关着：状态文件里没有 error 字符串，/healthz 也要说清原因。"""
+    code, body = health_response(
+        _payload(
+            profiles={
+                "web": _profile(
+                    healthy=False, remote_ports={"23334": False}, health_error=None
+                )
+            }
+        )
+    )
+    assert code == 503
+    assert body["unhealthy"] == ["web"]
+    # 远程和本地端口都点到：一条“为什么”比一个括号更有用。
+    assert body["errors"] == {
+        "web": "port 23334 is not listening; local port 1080 is not listening"
+    }
+
+
+def test_healthz_degraded_when_the_ssh_process_is_gone() -> None:
+    code, body = health_response(
+        _payload(profiles={"web": _profile(healthy=False, process_alive=False)})
+    )
+    assert code == 503
+    assert body["errors"] == {"web": "SSH process is not running"}
 
 
 def test_healthz_starting_is_not_reported_as_down() -> None:

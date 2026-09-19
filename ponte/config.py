@@ -41,6 +41,7 @@ __all__ = [
     "TunnelConfig",
     "SSHConfig",
     "SSHOptions",
+    "JumpHop",
     "Tunnel",
     "TUNNEL_FLAGS",
     "DEFAULT_BIND_HOST",
@@ -57,6 +58,7 @@ __all__ = [
     "is_loopback_host",
     "get_config",
     "load_config",
+    "daemon_paths_from_file",
     "set_config_path",
     "clear_config_cache",
     "config_search_paths",
@@ -261,20 +263,96 @@ class Profile:
 
 
 @dataclass(frozen=True)
-class SSHConfig:
-    """Connection parameters for the SSH endpoint."""
+class JumpHop:
+    """One hop of a jump chain — a machine ssh connects *through*.
+
+    Reaching a server that only a bastion can see used to mean hand-writing
+    ``ProxyJump`` into ``[ssh.options]``: undiscoverable, unvalidated, and
+    invisible to ``ponte doctor``. A hop is a first-class setting now, but a
+    *parsed* one rather than a raw string, because naming the first hop is what
+    lets doctor probe it (and report "the bastion is down" instead of "login
+    failed").
+    """
 
     host: str
-    user: str
-    identity_file: str
+    user: str = ""
     port: int = 22
-    known_hosts_file: str | None = None
-    options: SSHOptions = field(default_factory=SSHOptions)
 
     @property
     def destination(self) -> str:
-        """The ``user@host`` target passed to ``ssh``."""
-        return f"{self.user}@{self.host}"
+        """The hop as ``user@host``, or just ``host`` when no user is set."""
+        return f"{self.user}@{self.host}" if self.user else self.host
+
+    def render(self) -> str:
+        """This hop in OpenSSH ``ProxyJump`` syntax (``[user@]host[:port]``).
+
+        The port is omitted when it is 22 (the default ssh assumes) and IPv6
+        literals are bracketed, so the string handed to ``-J`` is what the user
+        would have typed themselves.
+        """
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        rendered = f"{self.user}@{host}" if self.user else host
+        return rendered if self.port == 22 else f"{rendered}:{self.port}"
+
+
+@dataclass(frozen=True)
+class SSHConfig:
+    """Connection parameters for the SSH endpoint.
+
+    ``host`` is the only required field. ``user`` and ``identity_file`` are
+    optional *on purpose*: when they are omitted ponte stops forcing ``-i`` and
+    ``user@`` onto the command line, so OpenSSH resolves them itself from
+    ``~/.ssh/config``, an ssh-agent identity, or its default key locations.
+    That means a machine with a working ``ssh myserver`` does not have to
+    duplicate Host/User/IdentityFile into ponte's config, and ponte stops
+    overriding an ``IdentityFile`` the user set in their SSH config.
+
+    ``jumps`` describes how to *reach* ``host`` when it is not directly
+    reachable — the private-network case, where a bastion sits in front of the
+    machine you actually want. It is passed to OpenSSH as ``-J`` (the same
+    ``ProxyJump`` the command line takes), so the hop's own credentials are
+    resolved by ssh from ``~/.ssh/config`` too: give the bastion a ``Host``
+    block instead of a second key path here.
+    """
+
+    host: str
+    user: str = ""
+    identity_file: str | None = None
+    port: int = 22
+    known_hosts_file: str | None = None
+    options: SSHOptions = field(default_factory=SSHOptions)
+    jumps: tuple[JumpHop, ...] = ()
+    """Hosts to reach :attr:`host` through, first hop first (``[ssh] jump``)."""
+
+    @property
+    def destination(self) -> str:
+        """The target passed to ``ssh``: ``user@host``, or just ``host``.
+
+        Dropping the ``user@`` half when no user is configured is what lets an
+        SSH ``Host`` alias (whose ``User`` lives in ``~/.ssh/config``) work.
+        """
+        return f"{self.user}@{self.host}" if self.user else self.host
+
+    @property
+    def proxy_jump(self) -> str | None:
+        """The value ssh's ``-J`` expects, or ``None`` without a jump chain.
+
+        Rendered from :attr:`jumps` (not kept as the raw string) so the command
+        line is always the canonical spelling, whatever the config wrote.
+        """
+        if not self.jumps:
+            return None
+        return ",".join(hop.render() for hop in self.jumps)
+
+    @property
+    def first_hop(self) -> JumpHop | None:
+        """The one hop this machine must be able to reach itself.
+
+        Only the first hop is reachable from here: every later one is reached
+        through its predecessor, so a local connection attempt to it would fail
+        on a perfectly healthy chain.
+        """
+        return self.jumps[0] if self.jumps else None
 
 
 @dataclass(frozen=True)
@@ -718,6 +796,44 @@ def load_config(path: _Path) -> TunnelConfig:
     return _parse_config(data, config_path)
 
 
+def daemon_paths_from_file(path: _Path | None = None) -> tuple[str, str]:
+    """Best-effort ``(pid_file, log_file)`` for a possibly-invalid config file.
+
+    The control commands (``stop`` / ``status`` / ``logs`` / ``watch``) need
+    these two paths and nothing else, and they must keep working when the rest
+    of the config no longer validates — otherwise a single typo in a tunnel
+    rule locks the user out of stopping the very daemon they need to stop.
+
+    So this reads *only* ``[daemon]`` with a raw TOML parse, ignores every other
+    problem in the file, and never raises: a missing, unreadable or syntactically
+    broken file yields the platform defaults.
+    """
+    default = _parse_daemon({})
+    try:
+        resolved = _resolve_config_path(path)
+        with open(resolved, "rb") as handle:
+            data = tomllib.load(handle)
+    except (ConfigError, OSError, tomllib.TOMLDecodeError):
+        return default.pid_file, default.log_file
+
+    section = data.get("daemon")
+    if not isinstance(section, Mapping):
+        return default.pid_file, default.log_file
+    try:
+        pid_file = _optional_str(section, "pid_file", default="")
+        log_file = _optional_str(section, "log_file", default="")
+    except ConfigError:
+        # A non-string pid_file is exactly the kind of typo that broke the
+        # strict load; treat it as "unset" rather than losing the whole path.
+        return default.pid_file, default.log_file
+
+    state_dir = _default_state_dir()
+    return (
+        _expand(pid_file) if pid_file else os.path.join(state_dir, "ponte.pid"),
+        _expand(log_file) if log_file else os.path.join(state_dir, "ponte.log"),
+    )
+
+
 def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
     warnings: list[str] = []
     _warn_unknown_keys(data, _KNOWN_TOP_LEVEL, "", warnings)
@@ -766,8 +882,21 @@ _KNOWN_TOP_LEVEL = frozenset(
     }
 )
 _KNOWN_PROFILE = frozenset({"name", "ssh", "tunnels"})
+#: Accepted spellings of the jump-host key. ``jump`` is the short one shipped
+#: in the template; ``proxy_jump`` is what an OpenSSH user reaches for first.
+_JUMP_KEYS = ("jump", "proxy_jump")
+
 _KNOWN_SSH = frozenset(
-    {"host", "port", "user", "identity_file", "known_hosts_file", "options"}
+    {
+        "host",
+        "port",
+        "user",
+        "identity_file",
+        "known_hosts_file",
+        "options",
+        "jump",
+        "proxy_jump",
+    }
 )
 _KNOWN_TUNNEL = frozenset(
     {"kind", "remote_port", "remote_host", "local_host", "local_port", "description"}
@@ -878,21 +1007,101 @@ def _parse_ssh(
     _expect_table(section, where)
     _warn_unknown_keys(section, _KNOWN_SSH, where, warnings)
     host = _require_str(section, "host", where)
-    user = _require_str(section, "user", where)
-    identity_file = _require_str(section, "identity_file", where)
+    # ``user`` / ``identity_file`` are optional: leaving them out defers to
+    # ``~/.ssh/config`` / ssh-agent instead of forcing ``user@`` and ``-i``.
+    user = _optional_str(section, "user", default="")
+    identity_file = _optional_str(section, "identity_file", default=None)
     port = _optional_int(
         section, "port", default=22, minimum=1, maximum=65535, where=where
     )
     known_hosts = _optional_str(section, "known_hosts_file", None)
     options = _parse_ssh_options(section.get("options", {}), where=f"{where}.options")
+    jumps = _parse_jump(section, where)
+    if jumps:
+        # Both spellings land on the command line as the *same* connection
+        # setting, and ssh resolves duplicates by precedence rather than
+        # complaint — so a profile that ends up with -J *and* -o ProxyJump would
+        # silently ignore one of them. Refuse instead of guessing.
+        conflicting = [
+            key
+            for key, _ in options.extra
+            if key.lower() in {"proxyjump", "proxycommand"}
+        ]
+        if conflicting:
+            raise ConfigValidationError(
+                f"Field '{where}.jump' cannot be combined with "
+                f"'{where}.options.{conflicting[0]}': both say how to reach the "
+                "server, and ssh would silently apply only one. Keep one of them."
+            )
     return SSHConfig(
         host=host,
         user=user,
-        identity_file=_expand(identity_file),
+        identity_file=_expand(identity_file) if identity_file else None,
         port=port,
         known_hosts_file=_expand(known_hosts) if known_hosts else None,
         options=options,
+        jumps=jumps,
     )
+
+
+#: One hop of a ProxyJump chain: ``[user@]host[:port]``. IPv6 literals have to
+#: be bracketed, because ``::1:2222`` cannot be split back into host and port.
+_JUMP_HOP_PATTERN = re.compile(
+    r"(?:(?P<user>[^@\s:,]+)@)?(?P<host>\[[^\]]+\]|[^@\s:,]+)(?::(?P<port>\d+))?"
+)
+
+
+def _parse_jump(section: Mapping[str, Any], where: str) -> tuple[JumpHop, ...]:
+    """Parse ``[ssh] jump`` (or its ``proxy_jump`` spelling) into hops.
+
+    The value keeps OpenSSH's own ``ProxyJump`` syntax — ``[user@]host[:port]``,
+    comma separated for a chain — because it is handed to ``-J`` verbatim.
+    Accepting the spelling people already type on the command line means there
+    is nothing new to learn, and nothing to translate on the way out.
+    """
+    present = [key for key in _JUMP_KEYS if section.get(key)]
+    if not present:
+        return ()
+    if len(present) > 1:
+        raise ConfigValidationError(
+            f"Fields '{where}.jump' and '{where}.proxy_jump' are two spellings "
+            "of the same setting; keep one"
+        )
+    key = present[0]
+    raw = section[key]
+    if isinstance(raw, bool) or not isinstance(raw, str):
+        raise ConfigValidationError(
+            f"Field '{where}.{key}' must be a string, got {type(raw).__name__}"
+        )
+
+    hops: list[JumpHop] = []
+    for chunk in raw.split(","):
+        spec = chunk.strip()
+        if not spec:
+            raise ConfigValidationError(
+                f"Field '{where}.{key}' has an empty hop in {raw!r}; "
+                "hops are separated by a single comma"
+            )
+        match = _JUMP_HOP_PATTERN.fullmatch(spec)
+        if match is None:
+            raise ConfigValidationError(
+                f"Field '{where}.{key}' has an invalid hop {spec!r}; expected "
+                "'[user@]host[:port]' (bracket IPv6 literals, e.g. 'ops@[::1]:2222')"
+            )
+        host = match.group("host")
+        if host.startswith("["):
+            host = host[1:-1]
+        if not host:
+            raise ConfigValidationError(
+                f"Field '{where}.{key}' has an empty host in hop {spec!r}"
+            )
+        port = 22
+        if match.group("port") is not None:
+            port = _check_int(
+                match.group("port"), "port", minimum=1, maximum=65535, where=f"{where}.{key}"
+            )
+        hops.append(JumpHop(host=host, user=match.group("user") or "", port=port))
+    return tuple(hops)
 
 
 def _parse_ssh_options(section: Any, where: str = "ssh.options") -> SSHOptions:
