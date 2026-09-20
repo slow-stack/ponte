@@ -325,7 +325,11 @@ python _smoke_test.py                          # zero-dependency quick check
 
 CI runs lint + types on Linux, and the test suite across
 Windows/Linux/macOS × Python 3.11/3.12, reporting coverage to
-[Codecov](https://codecov.io/gh/modusensus/ponte). A `build` job also installs
+[Codecov](https://codecov.io/gh/modusensus/ponte). One extra job re-runs the
+suite with `PONTE_TEST_THREAD_DELAY=0.15`: that injects latency into
+worker-thread sleeps and waits, so a test that only passes on a fast machine
+fails there *every* time instead of flaking once in a while. Set the same
+variable locally to reproduce such a machine. A `build` job also installs
 the built wheel and runs `ponte init`, so a packaging regression cannot ship
 again. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -626,8 +630,11 @@ python _smoke_test.py                          # 零依赖快速自检
 
 CI 在 Linux 上跑 lint + 类型检查，在 Windows/Linux/macOS × Python
 3.11/3.12 上跑测试，覆盖率上报到
-[Codecov](https://codecov.io/gh/modusensus/ponte)。另有一个 `build` 任务会
-安装打好的 wheel 并执行 `ponte init`，避免打包问题再次溜进发布。详见
+[Codecov](https://codecov.io/gh/modusensus/ponte)。另有一个任务会用
+`PONTE_TEST_THREAD_DELAY=0.15` 再跑一遍：它往工作线程的 sleep/wait 里注入
+延迟，于是"只有机器够快才通过"的测试会**每次都**在那里失败，而不是偶发地
+红一次。本地设同一个变量即可复现这种机器。`build` 任务会安装打好的 wheel 并
+执行 `ponte init`，避免打包问题再次溜进发布。详见
 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 📝 注意事项

@@ -36,6 +36,15 @@ CI runs lint + types on Linux, the same test suite on Windows / Linux / macOS ×
 Python 3.11 / 3.12, and a `build` job that installs the wheel and runs
 `ponte init`. Coverage is uploaded to Codecov.
 
+One more job re-runs the suite with `PONTE_TEST_THREAD_DELAY=0.15`. That variable
+makes `tests/conftest.py` inject latency into worker-thread sleeps and waits, so a
+test that only passes because the machine is fast fails there **every time**
+instead of flaking once in a while. Run it the same way before blaming a runner:
+
+```bash
+PONTE_TEST_THREAD_DELAY=0.15 pytest     # 慢机器模拟（Git Bash / POSIX 语法）
+```
+
 ## Project layout
 
 ```
@@ -151,6 +160,15 @@ python _smoke_test.py           # 零依赖冒烟检查
 Linux 上跑 lint + 类型检查，在 Windows / Linux / macOS × Python 3.11 / 3.12
 上跑同一套测试，另有 `build` 任务会安装 wheel 并执行 `ponte init`。覆盖率
 上报到 Codecov。
+
+还有一个任务会用 `PONTE_TEST_THREAD_DELAY=0.15` 再跑一遍：这个变量让
+`tests/conftest.py` 往工作线程的 sleep/wait 里注入延迟，于是“只有机器够快才
+通过”的测试会**每次都**在那里失败，而不是偶发地红一次。怀疑是 runner 抽风之前，
+先这样在本地跑一遍：
+
+```bash
+PONTE_TEST_THREAD_DELAY=0.15 pytest     # 模拟慢机器（Git Bash / POSIX 语法）
+```
 
 ## 项目结构
 
