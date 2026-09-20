@@ -1039,14 +1039,22 @@ hsot = "127.0.0.1"
     [
         ("127.0.0.1", True),
         ("127.1.2.3", True),
+        ("127.255.255.255", True),
+        ("[127.0.0.1]", True),
+        ("  127.0.0.1  ", True),
         ("localhost", True),
         ("LOCALHOST", True),
         ("[::1]", True),
+        ("::ffff:127.0.0.1", True),
         ("", False),
         ("0.0.0.0", False),
         ("::", False),
+        ("[::]", False),
         ("192.168.1.5", False),
         ("example.com", False),
+        ("notlocalhost", False),
+        ("127.1", False),
+        ("localhost.", False),
     ],
 )
 def test_is_loopback_host(host, expected) -> None:
@@ -1054,8 +1062,33 @@ def test_is_loopback_host(host, expected) -> None:
 
     ``""`` 特别重要：``http.server`` 把空地址当成 *所有网卡*，所以它绝不是
     回环地址，不能因为“看起来是空的”就放行。
+
+    最后两条是故意的窄：``127.1``（操作系统接受的简写）与 ``localhost.``
+    （绝对形式）都真的指向回环，但解析器不认，于是要令牌——判错的方向必须
+    是“多要一个令牌”，而不是“少要一个”。
     """
     assert is_loopback_host(host) is expected
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.corp.example",
+        "127.0.0.1.example.com",
+        "127.0.0.1.",
+        "127.attacker.tld",
+    ],
+)
+def test_is_loopback_host_rejects_names_that_merely_start_with_127(host) -> None:
+    """前缀匹配会放行**主机名**，而名字解析到哪里由域名所有者决定。
+
+    ``is_loopback_host`` 是 ``ensure_bindable`` 唯一的判据，也就是看板（服务器
+    地址、登录用户、转发端口）与网络之间的全部防线：放行一个能解析到公网的名字
+    等于无令牌把内网拓扑绑出去。
+    """
+    assert is_loopback_host(host) is False
+    with pytest.raises(ConfigValidationError):
+        ensure_bindable(host, "")
 
 
 def test_ensure_bindable_treats_an_empty_host_as_exposed() -> None:

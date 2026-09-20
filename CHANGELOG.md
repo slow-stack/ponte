@@ -69,6 +69,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the truthful number from the unrounded value. The ratio is now rounded to
   three decimals, which keeps the tenth of a percent those surfaces display.
 
+### Security
+
+- **A hostname that merely started with `127.` skipped the token requirement.**
+  Whether `serve.host` may be bound without a `serve.token` is decided by
+  `is_loopback_host`, which accepted any spelling beginning with `127.` — and
+  that also matches *names*: `127.corp.example` is a perfectly legal hostname
+  that resolves wherever its owner points it, so configuring it exposed the
+  dashboard (server addresses, login users, forwarded ports) to a public
+  address with no token, which is the one thing `ensure_bindable` exists to
+  prevent. The address is now parsed with `ipaddress` and judged by
+  `is_loopback`, with `localhost` the only accepted name. Spellings the OS
+  accepts but that parser rejects — the shorthand `127.1`, the absolute form
+  `localhost.` — now count as exposed, so the remaining error is "demanded a
+  token it did not need" rather than "skipped the token it did need".
+- **Request lines reached the log verbatim.** `log_message` — and therefore
+  `log_error`, which funnels through it — forwarded the raw request line into
+  the log record. `BaseHTTPRequestHandler` decodes that line as latin-1, so a
+  client can put ESC, NUL, DEL, C1 bytes or bidi overrides in it: enough to make
+  `ponte serve`'s log claim something that never happened, or to make a terminal
+  tailing it render output it never received. Untrusted text is now neutralised
+  before logging, each non-printable character becoming a visible `?` (kept
+  rather than deleted, so an attempt leaves a trace instead of vanishing), and
+  the line is capped at 500 characters so a 64 KiB request line cannot become a
+  64 KiB log line.
+
 ### Changed
 
 - **Every SSH path now builds its connection flags in one place.** The tunnel,

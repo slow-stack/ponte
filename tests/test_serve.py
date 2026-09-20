@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import re
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -22,6 +24,8 @@ import pytest
 from ponte import __version__
 from ponte.config import ConfigValidationError, ensure_bindable
 from ponte.serve import (
+    _LOG_TEXT_LIMIT,
+    _sanitize_log,
     create_server,
     dashboard_html,
     health_response,
@@ -599,6 +603,39 @@ def test_dashboard_waits_quietly_for_the_first_check() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Log lines
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("GET /healthz HTTP/1.1", "GET /healthz HTTP/1.1"),
+        ("two words", "two words"),
+        ("esc\x1b[31mred", "esc?[31mred"),
+        ("nul\x00del\x7f", "nul?del?"),
+        ("bidi\u202eforged", "bidi?forged"),
+        ("line\u2028break", "line?break"),
+        ("tab\tsplit", "tab?split"),
+    ],
+)
+def test_sanitize_log_neutralises_forging_characters(raw, expected) -> None:
+    """可打印字符（含普通空格）原样保留，其余换成可见的 ``?``。
+
+    换成 ``?`` 而不是直接删除：删掉会让 ``FAKE-LOG`` 变成 ``FAKELOG``，把一次
+    尝试性注入从日志里抹掉；留着可读痕迹才能看出有人在试。
+    """
+    assert _sanitize_log(raw) == expected
+
+
+def test_sanitize_log_caps_a_hostile_request_line() -> None:
+    """``http.server`` 肯读 64 KiB 的请求行，日志行不能跟着它长。"""
+    capped = _sanitize_log("A" * 64_000)
+    assert len(capped) == _LOG_TEXT_LIMIT + 1  # +1 是末尾的省略号
+    assert capped.endswith("…")
+
+
+# ---------------------------------------------------------------------------
 # End to end: a real server, real HTTP
 # ---------------------------------------------------------------------------
 
@@ -627,6 +664,34 @@ def _get(url: str, *, headers: dict[str, str] | None = None, method: str = "GET"
             return response.status, response.headers, response.read().decode("utf-8")
     except urllib.error.HTTPError as error:
         return error.code, error.headers, error.read().decode("utf-8")
+
+
+def _raw_request(base: str, request_line: bytes) -> None:
+    """Speak HTTP by hand: *urllib* refuses to send control characters."""
+    host, _, port = base.removeprefix("http://").partition(":")
+    with socket.create_connection((host, int(port)), timeout=5) as sock:
+        sock.sendall(request_line + b"\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        with contextlib.suppress(OSError, TimeoutError):
+            while sock.recv(65536):
+                pass
+
+
+def test_request_lines_cannot_forge_log_lines(caplog) -> None:
+    """请求行是攻击者可控的，日志则是给人看的——两者不能直接相接。
+
+    走裸套接字是必须的（``urllib`` 不会替我们发控制字符，而真实攻击者会）：
+    ESC 能伪造终端输出，NUL/DEL 能骗过日志查看器，而 latin-1 解码还会把 UTF-8
+    字节变成 C1 控制字符。
+    """
+    hostile = b"GET /x\x1b[31mFORGED\x00\x7f\xc2\x80 HTTP/1.1"
+    with caplog.at_level(logging.DEBUG, logger="ponte.serve"):
+        with _running_server(lambda: _payload()) as base:
+            _raw_request(base, hostile)
+
+    logged = [record.getMessage() for record in caplog.records if record.name == "ponte.serve"]
+    assert any("FORGED" in message for message in logged), "整条消息不该被丢弃"
+    for message in logged:
+        assert message.isprintable(), message
 
 
 def test_end_to_end_endpoints_answer() -> None:

@@ -23,6 +23,7 @@ file silently redirecting the tunnel to another server is a real footgun.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
@@ -1362,9 +1363,24 @@ def is_loopback_host(host: str) -> bool:
     exposed. That includes ``""``, which ``http.server`` reads as *all
     interfaces*, so an odd spelling cannot sneak past the token requirement in
     :func:`ensure_bindable`.
+
+    The address is *parsed* rather than pattern-matched. A ``"127."`` prefix
+    test looks equivalent to ``127.0.0.0/8`` but is not: it also accepts
+    **names**, and ``127.corp.example`` is a perfectly legal hostname that
+    resolves wherever its owner points it. This function is the only thing
+    between the dashboard (server addresses, login users, forwarded ports) and
+    the network, so a name that merely starts with ``127.`` must not be able to
+    skip the token. Spellings the OS would accept but this parser rejects — the
+    shorthand ``127.1``, the absolute form ``localhost.``, ``::`` for that
+    matter — therefore count as exposed: erring towards demanding a token.
     """
-    name = host.strip().strip("[]").lower()
-    return name in ("localhost", "::1") or name.startswith("127.")
+    name = host.strip()
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return name.lower() == "localhost"
 
 
 def ensure_bindable(host: str, token: str) -> None:

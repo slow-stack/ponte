@@ -178,6 +178,13 @@ refresh = 5                       # dashboard auto-refresh, seconds
 # ipv6 hosts are fine too: host = "::1"
 ```
 
+Loopback is decided by *parsing* the address, never by matching its spelling: a
+name such as `127.corp.example` resolves wherever its owner points it, so it
+counts as exposed and needs a token. Shorthand the OS would accept but the
+parser does not (`127.1`, or the absolute form `localhost.`) also counts as
+exposed — the error message says so, and `127.0.0.1` is what the default uses
+anyway.
+
 Clients then pass `?token=...` (handy for scrapers) or `Authorization: Bearer
 ...`. All four endpoints are read-only, re-read the daemon status per request and
 send `Cache-Control: no-store`, so a page can never show a stale "healthy" for a
@@ -476,6 +483,11 @@ token = "一个足够长的随机串"      # 非回环地址必需
 refresh = 5                       # 看板自动刷新秒数
 # 也支持 IPv6：host = "::1"
 ```
+
+回环与否是**解析**地址得出的，不靠拼写匹配：像 `127.corp.example` 这样的名字
+解析到哪里由它的所有者决定，所以它算“对外”，需要令牌。操作系统接受、但解析器
+不认的简写（`127.1`，或绝对形式 `localhost.`）同样算“对外”——报错信息里会说明，
+而默认值本来就是 `127.0.0.1`。
 
 客户端用 `?token=...`（脚本/采集器方便）或 `Authorization: Bearer ...`。
 四个接口全是只读、每次请求都重新读取守护进程状态，并带
