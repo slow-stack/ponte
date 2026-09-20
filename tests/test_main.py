@@ -91,10 +91,15 @@ def test_version_option() -> None:
 
 
 def test_config_command(monkeypatch) -> None:
-    monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
+    cfg = _cfg()
+    monkeypatch.setattr("ponte.main.get_config", lambda: cfg)
     result = CliRunner().invoke(app, ["config"])
     assert result.exit_code == 0
-    assert "example.com" in result.output
+    # 比配置里的值，而不是拿域名字面量做子串包含：那种写法在源码里正是一次
+    # “不完整的地址校验”（CodeQL 的 py/incomplete-url-substring-sanitization 报的
+    # 就是它，在这里属于误报 — 但那个形状本身不该留在代码里），换成配置里的值
+    # 之后，断言也真的钉住了“印出来的就是配的那台服务器”。
+    assert cfg.profiles[0].destination in result.output
     assert "23334" in result.output
     assert "pid_file" in result.output
 
