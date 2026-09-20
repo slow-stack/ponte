@@ -109,6 +109,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI exercises two further environments and one further failure class.** The
+  test matrix now runs Python 3.13 and 3.14 as well — the runtime is not
+  decoration: `IPv4Address` handling of `::ffff:127.0.0.1` changed between 3.11
+  and 3.12, and that difference decided whether this tool demanded an auth
+  token. One job runs the suite under a C locale (non-UTF-8 stdio) in a
+  half-hour timezone with deprecation warnings as errors. And the "slow runner"
+  job gained a second, independent axis: `PONTE_TEST_THREAD_START_DELAY` holds a
+  freshly started thread before its first line runs — a case stretching waits
+  cannot reach, because a thread that has not started executing performs no
+  waits to stretch.
 - **Every SSH path now builds its connection flags in one place.** The tunnel,
   the login test behind `ponte test` / the health loop / `doctor`, and the
   server-side port probe each assembled their own `-o`/`-i`/`-p` list, so a
