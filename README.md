@@ -80,7 +80,8 @@
   its permissions, SSH reachability, listening ports, auto-start status and the
   notify channel, each row ending in a concrete fix instead of a black box.
 - 📊 **A dashboard and a metrics endpoint** — `ponte serve` puts the same status
-  on HTTP: `/` is a self-contained dashboard (no CDN, no JavaScript), `/healthz`
+  on HTTP: `/` is a self-contained dashboard (one file, no CDN, no external
+  assets, complete without JavaScript), `/healthz`
   answers `503` when a tunnel is actually broken, `/metrics` speaks Prometheus
   and `/status.json` is exactly `ponte status --json`. Loopback-only by default;
   exposing it needs an explicit token.
@@ -141,7 +142,7 @@ ponte serve --open     # ...and open it in your browser
 
 | Endpoint | What it answers |
 |----------|-----------------|
-| `/` | the dashboard: per-tunnel health, session age, availability, port state, last disconnect with its reason, event feed |
+| `/` | the dashboard: one row per tunnel — verdict, destination and jump chain, forwarded ports as chips, session age, availability, last disconnect reason; click a row for the full statistics and the event feed. Light and dark, refreshed in place (expanded rows and scroll position survive), and a `<noscript>` reload if scripting is off |
 | `/healthz` | `200` while the tunnels work, `503` as soon as one is broken — the endpoint to point a monitor at |
 | `/metrics` | Prometheus text exposition: session age, cumulative up/down time, availability, reconnects, port-listening state |
 | `/status.json` | exactly the payload of `ponte status --json` |
@@ -157,8 +158,8 @@ and on a shared/NATed uplink it fails on its own often enough (roughly a third
 of ticks in our measurements). So a check that could not be *completed* is kept
 apart from a check that produced a verdict: `/healthz` answers `200 unverified`
 (not `503`), `ponte status` shows `未知` with the probe's reason instead of
-`异常`, unobserved ports are simply not rendered, and `ponte_profiles_unknown`
-counts them. Only a conclusive failure — the SSH process gone, or a port a probe
+`异常`, the dashboard prints `未观测` for a port group the probe never reached
+instead of a red `未监听`, and `ponte_profiles_unknown` counts them. Only a conclusive failure — the SSH process gone, or a port a probe
 *did* reach and found closed — pages you or triggers the zombie-session
 reconnect.
 
@@ -384,8 +385,9 @@ again. See [CONTRIBUTING.md](CONTRIBUTING.md).
   让你在真出事**之前**就验证通道可用。默认关闭：不开启就绝不会外发任何数据。
 - 🩺 **`ponte doctor`** — 一条命令逐项体检：配置、密钥及其权限、SSH 连通性、
   监听端口、开机自启状态、通知通道，每行都给出具体修法而不是留个黑箱。
-- 📊 **看板与指标接口** — `ponte serve` 把同一份状态摆到 HTTP 上：`/` 是自包含的
-  看板（不依赖 CDN、不用 JavaScript），`/healthz` 在隧道真的断时回 `503`，
+- 📊 **看板与指标接口** — `ponte serve` 把同一份状态摆到 HTTP 上：`/` 是一个
+  自包含的看板（单文件、不依赖 CDN 与任何外部资源，关掉脚本也能完整渲染），
+  `/healthz` 在隧道真的断时回 `503`，
   `/metrics` 说 Prometheus 格式，`/status.json` 就是 `ponte status --json`。
   默认只监听本机；要对外必须先给令牌。
 - 🖥️ **跨平台** — 自动查找 `ssh`、按平台落盘运行时文件、可移植的远程端口探测
@@ -443,7 +445,7 @@ ponte serve --open     # 顺手在浏览器里打开
 
 | 接口 | 回答什么问题 |
 |------|--------------|
-| `/` | 看板：逐条隧道的健康、当前会话时长、在线率、端口状态、上次断线原因与事件流 |
+| `/` | 看板：一行一条隧道——状态、目标与跳板机、端口 chips、会话时长、在线率、上次断线原因；点开该行看完整统计与事件流。跟随浅色/深色主题，原地刷新（展开的行与滚动位置都不会丢），关掉脚本则退化为整页刷新 |
 | `/healthz` | 隧道正常时 `200`，任一条断开立即 `503` —— 监控就探这个 |
 | `/metrics` | Prometheus 文本格式：会话时长、累计在线/离线、在线率、重连次数、端口监听状态 |
 | `/status.json` | 与 `ponte status --json` 完全一致的载荷 |
@@ -456,8 +458,9 @@ ponte serve --open     # 顺手在浏览器里打开
 **“未知”不是“挂了”。** 远程端口探测本身就是一条独立的 SSH 连接，在共享/NAT
 出口上它自己就会失败（我们实测约三分之一的检查如此）。所以 ponte 把“没问成”
 和“问了、答案是坏的”分开：`/healthz` 回 `200 unverified`（而不是 `503`），
-`ponte status` 显示黄色的 `未知` 并附上探测失败原因（而不是 `异常`），没被观察到的
-端口干脆不显示，`ponte_profiles_unknown` 单独计数。只有确凿的失败——SSH 进程没了，
+`ponte status` 显示黄色的 `未知` 并附上探测失败原因（而不是 `异常`），看板对探针
+没探到的那一组端口写明「未观测」而不是画成红色的「未监听」，
+`ponte_profiles_unknown` 单独计数。只有确凿的失败——SSH 进程没了，
 或探针**确实**连上并看到端口没在听——才会报警或触发假死强制重连。
 
 **安全模型。** 看板会列出你的服务器地址、登录用户与转发端口——这是一张

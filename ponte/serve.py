@@ -3,9 +3,12 @@
 ``ponte watch`` answers "is my tunnel up?" for a human sitting at the machine.
 This module answers it for everything else:
 
-* ``/``            a self-contained HTML dashboard — no CDN, no JavaScript, no
+* ``/``            a self-contained HTML dashboard — one file, no CDN, no
                    external assets, so it renders from ``curl``, a phone
-                   browser on the same host, or an air-gapped box;
+                   browser on the same host, or an air-gapped box. It is
+                   rendered complete on the server and works with scripting
+                   off (a ``<noscript>`` meta refresh reloads it); an inline
+                   script only upgrades that reload into an in-place refresh;
 * ``/healthz``     a probe for uptime monitors, whose status code reports
                    whether the *tunnel* works, not whether a process exists;
 * ``/metrics``     Prometheus text exposition, for a Prometheus / Grafana /
@@ -20,7 +23,9 @@ Three rules shape the implementation:
   rather than served with a warning nobody reads.
 * **Standard library only.** ``http.server``, not a web framework: ponte exists
   to be dropped on a machine that has nothing but SSH and Python, and a
-  dependency would cost more than this feature is worth.
+  dependency would cost more than this feature is worth. The same instinct
+  applies to the page: no bundler, no framework, one inline script that does
+  one job.
 * **Read-only, and always fresh.** Every request re-reads the daemon status, so
   a page can never show a cached "healthy" for a tunnel that has since died.
   Nothing here can start, stop or reconfigure anything — the worst a leaked
@@ -529,73 +534,382 @@ _PAGE = Template(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="$refresh">
 <meta name="color-scheme" content="dark light">
+<!-- The reload fallback for a browser that runs no script. It lives in
+     <noscript> on purpose: a browser with scripting enabled never creates the
+     meta element at all, so it cannot race the in-place refresh below. -->
+<noscript><meta http-equiv="refresh" content="$refresh"></noscript>
 <title>ponte · $title</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14'%3E%F0%9F%94%81%3C/text%3E%3C/svg%3E">
 <style>
-:root { color-scheme: dark; }
+:root {
+  color-scheme: dark;
+  --ok: #3fb950; --ok-bg: #0f2a1a; --ok-line: #2ea043;
+  --bad: #f85149; --bad-bg: #2d1416; --bad-line: #e5534b;
+  --unk: #d29922; --unk-bg: #2b2411; --unk-line: #bb8009;
+  --accent: #58a6ff;
+  --bg: #0b0f14; --panel: #131922; --row: #18202b; --inset: #0f141b;
+  --head: #0f141b; --line: #232c38;
+  /* --faint carries 12px secondary text (pid, footer, event timestamps), so it
+     is picked for a 4.5:1 contrast on both the page and the panel, not for
+     looking quiet. */
+  --text: #e6edf3; --dim: #93a1b1; --faint: #7b8794;
+  --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+/* The page used to declare ``dark light`` and then hard-code a dark palette;
+   it keeps its word now. */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --ok: #1a7f37; --ok-bg: #dafbe1; --ok-line: #a2e2b6;
+    --bad: #cf222e; --bad-bg: #ffebe9; --bad-line: #ffc9c4;
+    --unk: #9a6700; --unk-bg: #fff8c5; --unk-line: #eedb8b;
+    --accent: #0969da;
+    --bg: #f6f8fa; --panel: #ffffff; --row: #f3f6f9; --inset: #f6f8fa;
+    --head: #eef2f6; --line: #d8dee4;
+    --text: #1f2328; --dim: #59636e; --faint: #69707a;
+  }
+}
 * { box-sizing: border-box; }
 body {
-  margin: 0; padding: 20px;
-  font: 14px/1.6 ui-sans-serif, system-ui, "Segoe UI", "PingFang SC",
+  margin: 0; padding: 0 20px 28px;
+  font: 14px/1.55 ui-sans-serif, system-ui, "Segoe UI", "PingFang SC",
         "Microsoft YaHei", sans-serif;
-  background: #0e1116; color: #e8eaed;
+  background: var(--bg); color: var(--text);
+  -webkit-font-smoothing: antialiased;
 }
+/* Sticky: the verdict and the counts are the one thing worth keeping in view
+   when the tunnel list is longer than the window. */
 header {
-  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
-  margin-bottom: 16px;
+  position: sticky; top: 0; z-index: 2;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
+  padding: 14px 0 12px; margin-bottom: 12px;
+  background: var(--bg); border-bottom: 1px solid var(--line);
 }
-h1 { font-size: 17px; margin: 0; letter-spacing: .02em; }
-h1 span { color: #6b7280; font-weight: 400; }
-h2 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+.brand { display: flex; align-items: center; gap: 9px; }
+.brand svg { width: 21px; height: 21px; color: var(--accent); flex: none; }
+h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .01em; }
+h1 span { margin-left: 3px; color: var(--faint); font-size: 12px; font-weight: 400; }
+h2 { font-size: 15px; margin: 0 0 6px; }
 h3 {
-  font-size: 11px; margin: 14px 0 6px; color: #9aa4b2; font-weight: 600;
-  text-transform: uppercase; letter-spacing: .07em;
+  font-size: 11px; margin: 0 0 7px; color: var(--dim); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .08em;
 }
-main { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
-.card {
-  background: #161b22; border: 1px solid #262d38; border-left: 4px solid #6b7280;
-  border-radius: 10px; padding: 14px 16px;
+.summary {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  margin-left: auto; font-size: 13px;
 }
-.card.ok { border-left-color: #2ea043; }
-.card.bad { border-left-color: #e5534b; }
-.card.unknown { border-left-color: #d29922; }
+.tiles { display: flex; flex-wrap: wrap; gap: 6px; }
+.tile {
+  display: flex; align-items: baseline; gap: 5px; padding: 3px 9px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--dim); font-size: 12px;
+}
+.tile b {
+  font-size: 15px; font-weight: 650; color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.tile.ok b { color: var(--ok); }
+.tile.bad b { color: var(--bad); }
+.tile.unknown b { color: var(--unk); }
+.meta { color: var(--faint); font-size: 12px; }
+.meta b { color: var(--dim); font-weight: 600; font-variant-numeric: tabular-nums; }
 .pill {
-  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
   font-size: 12px; font-weight: 600; white-space: nowrap;
 }
-.pill.ok { background: #10281a; color: #3fb950; border: 1px solid #2ea043; }
-.pill.bad { background: #2d1416; color: #f85149; border: 1px solid #e5534b; }
-.pill.unknown { background: #2b2411; color: #d29922; border: 1px solid #bb8009; }
+.pill.ok { background: var(--ok-bg); color: var(--ok); border: 1px solid var(--ok-line); }
+.pill.bad { background: var(--bad-bg); color: var(--bad); border: 1px solid var(--bad-line); }
+.pill.unknown { background: var(--unk-bg); color: var(--unk); border: 1px solid var(--unk-line); }
+
+/* One tunnel per row. The row *is* a <details><summary>, so the compact view
+   and the full detail are one element and one click. */
+.board {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  overflow: hidden; box-shadow: 0 1px 2px rgba(0, 0, 0, .14);
+}
+.grid {
+  display: grid; align-items: start; gap: 4px 16px;
+  grid-template-columns:
+    minmax(210px, 1.4fr) minmax(150px, 1fr) minmax(190px, 1.3fr) 1.6em;
+}
+/* 17px = the rows' 14px padding plus their 3px state bar, so the column
+   headings sit exactly above the values they name. */
+.head {
+  padding: 8px 14px 8px 17px; font-size: 11px; font-weight: 600;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--faint);
+  background: var(--head); border-bottom: 1px solid var(--line);
+}
+details.tunnel { border-bottom: 1px solid var(--line); }
+details.tunnel:last-child { border-bottom: 0; }
+details.tunnel > summary {
+  list-style: none; cursor: pointer; padding: 10px 14px;
+  border-left: 3px solid var(--faint); transition: background .12s ease;
+}
+details.tunnel > summary::-webkit-details-marker { display: none; }
+details.tunnel > summary:hover { background: var(--row); }
+details.tunnel[open] > summary { background: var(--row); }
+details.tunnel.ok > summary { border-left-color: var(--ok-line); }
+details.tunnel.bad > summary { border-left-color: var(--bad-line); }
+details.tunnel.unknown > summary { border-left-color: var(--unk-line); }
+/* Painted by the inline script on a row whose verdict just changed, so a tunnel
+   that died between two refreshes is noticed instead of being read as "it was
+   always like that". */
+@keyframes flash { from { background: var(--unk-bg); } to { background: transparent; } }
+details.tunnel.changed > summary { animation: flash 2.4s ease-out 1; }
+.ident { min-width: 0; }
+.title { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.name { font-weight: 600; }
+.target, .via {
+  font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere;
+}
+.target { color: var(--dim); }
+/* Amber on purpose: the bastion is the link that fails first and the one the
+   rest of the config cannot even name. */
+.via { color: var(--unk); }
+.chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.chip {
+  display: inline-flex; align-items: baseline; gap: 5px; padding: 2px 8px;
+  border-radius: 7px; font-size: 12px; font-family: var(--mono);
+  border: 1px solid var(--line); background: var(--row); color: var(--dim);
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.chip .k { opacity: .72; }
+.chip.ok { color: var(--ok); border-color: var(--ok-line); background: var(--ok-bg); }
+.chip.bad { color: var(--bad); border-color: var(--bad-line); background: var(--bad-bg); }
+.chip.unknown { color: var(--unk); border-color: var(--unk-line); background: var(--unk-bg); }
+.facts {
+  color: var(--dim); font-size: 12.5px; min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.facts div { overflow-wrap: anywhere; }
+.hi { color: var(--bad); }
+.warn { color: var(--unk); }
+/* Availability at a glance: half of "99% up" is the shape, not the digits.
+   Tabular digits above also keep a number from reflowing as it changes. */
+.bar {
+  display: inline-block; width: 40px; height: 6px; margin-left: 6px;
+  border-radius: 3px; background: var(--line); overflow: hidden;
+  vertical-align: middle;
+}
+.bar i { display: block; height: 100%; background: var(--ok); }
+.bar.warn i { background: var(--unk); }
+.bar.bad i { background: var(--bad); }
+.caret { color: var(--faint); text-align: right; user-select: none; }
+/* Literal glyphs, not CSS escapes: this template is an ordinary Python
+   string, where a "\25xx" escape is read as an *octal* escape by Python and
+   never reaches the browser as a character reference. */
+.caret::after { content: "▾"; }
+details.tunnel[open] .caret { color: var(--text); }
+details.tunnel[open] .caret::after { content: "▴"; }
+.panel {
+  display: grid; gap: 14px 26px; padding: 12px 14px 16px 17px;
+  background: var(--inset); border-left: 3px solid var(--line);
+  border-top: 1px solid var(--line);
+  grid-template-columns: minmax(250px, 1fr) minmax(250px, 1fr);
+}
+.panel > div { min-width: 0; }
 table.kv { width: 100%; border-collapse: collapse; }
 table.kv th {
-  text-align: left; font-weight: 500; color: #9aa4b2; padding: 2px 10px 2px 0;
+  text-align: left; font-weight: 500; color: var(--dim); padding: 2px 10px 2px 0;
   white-space: nowrap; vertical-align: top;
 }
-table.kv td { padding: 2px 0; width: 100%; word-break: break-word; }
-.feed {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px;
-  max-height: 190px; overflow-y: auto;
+table.kv td {
+  padding: 2px 0; word-break: break-word; font-variant-numeric: tabular-nums;
 }
-.feed .ev { display: flex; gap: 8px; padding: 1px 0; }
-.feed .t { color: #6b7280; }
+.feed { font-family: var(--mono); font-size: 12px; max-height: 190px; overflow-y: auto; }
+.feed .ev { display: flex; gap: 8px; padding: 1px 4px; border-radius: 4px; }
+.feed .ev:hover { background: var(--row); }
+.feed .t { color: var(--faint); font-variant-numeric: tabular-nums; }
 .feed .i { width: 1em; text-align: center; flex: none; }
-.i.ok { color: #3fb950; } .i.bad { color: #f85149; }
-.i.warn { color: #d29922; } .i.dim { color: #6b7280; }
-footer { margin-top: 16px; color: #6b7280; font-size: 12px; }
-footer a { color: #58a6ff; text-decoration: none; }
+.i.ok { color: var(--ok); } .i.bad { color: var(--bad); }
+.i.warn { color: var(--unk); } .i.dim { color: var(--faint); }
+.note { padding: 18px; color: var(--dim); }
+code {
+  font-family: var(--mono); background: var(--inset);
+  border: 1px solid var(--line); padding: 1px 5px; border-radius: 5px;
+}
+footer {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  margin-top: 14px; color: var(--faint); font-size: 12px;
+}
+footer .links { margin-left: auto; display: flex; flex-wrap: wrap; gap: 10px; }
+footer a { color: var(--accent); text-decoration: none; }
 footer a:hover { text-decoration: underline; }
-.muted { color: #6b7280; }
+/* The refresh state, told rather than assumed: a page still showing a reading
+   from five minutes ago is worse than one that admits it stopped. */
+.live { display: inline-flex; align-items: center; gap: 6px; }
+.live::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--faint);
+}
+.live.ok::before { background: var(--ok); }
+.live.bad { color: var(--bad); }
+.live.bad::before { background: var(--bad); animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+button.pause {
+  font: inherit; color: var(--dim); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 7px; padding: 2px 9px;
+  cursor: pointer;
+}
+button.pause:hover { color: var(--text); border-color: var(--accent); }
+.muted { color: var(--faint); }
+/* Narrow screens: stack the row instead of scrolling sideways. */
+@media (max-width: 760px) {
+  .head { display: none; }
+  .grid { grid-template-columns: 1fr; gap: 6px; }
+  .caret { text-align: left; }
+  .panel { grid-template-columns: 1fr; }
+  header { position: static; }
+  .summary { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
 </style>
 </head>
 <body>
-<header><h1>ponte <span>v$version</span></h1>$summary</header>
-<main>$cards</main>
-<footer>数据来自 ponte status 的同一份状态，每 $refresh 秒自动刷新。接口：
-<a href="/status.json">status.json</a> ·
-<a href="/metrics">metrics</a> ·
-<a href="/healthz">healthz</a></footer>
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+         stroke-linecap="round" aria-hidden="true">
+      <path d="M2 18h20M5 18V9M19 18V9M2 18C2 9.4 6.6 5.5 12 5.5S22 9.4 22 18"/>
+      <path d="M5 9.5h14"/>
+    </svg>
+    <h1>ponte <span>v$version</span></h1>
+  </div>
+  <div class="summary" id="summary">$summary</div>
+</header>
+<main id="board">$board</main>
+<footer>
+  <span class="live" id="live">每 $refresh 秒自动刷新（无脚本时整页刷新）</span>
+  <button class="pause" id="pauser" type="button" hidden>暂停</button>
+  <span class="links">数据来自 ponte status 的同一份状态，点任意一行看明细 ·
+  <a href="/status.json">status.json</a> ·
+  <a href="/metrics">metrics</a> ·
+  <a href="/healthz">healthz</a></span>
+</footer>
+<script>
+/* Progressive enhancement, in one place and one direction: everything above is
+   already complete, and this only upgrades the refresh. Without a script the
+   <noscript> meta reloads the whole page; with one, the same server-rendered
+   markup is fetched and swapped in place, so expanded rows stay expanded and the
+   scroll position does not jump.
+
+   Re-using the server's own HTML rather than re-rendering here from the JSON is
+   deliberate: a second renderer is exactly how a dashboard starts disagreeing
+   with `ponte status`. */
+(function () {
+  var board = document.getElementById('board');
+  var summary = document.getElementById('summary');
+  var live = document.getElementById('live');
+  var pauser = document.getElementById('pauser');
+  if (!board || !summary || !live) { return; }
+  var every = $refresh * 1000;
+  var timer = null;
+  var failures = 0;
+  var paused = false;
+
+  function clock() {
+    function pad(value) { return (value < 10 ? '0' : '') + value; }
+    var now = new Date();
+    return pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+  }
+
+  function say(tone, text) {
+    live.className = 'live' + (tone ? ' ' + tone : '');
+    live.textContent = text;
+  }
+
+  /* Open rows and their verdicts, read before the swap so both survive it. */
+  function snapshot() {
+    var open = {}, tones = {}, rows = board.querySelectorAll('details.tunnel');
+    for (var i = 0; i < rows.length; i++) {
+      var name = rows[i].getAttribute('data-profile');
+      if (rows[i].open) { open[name] = 1; }
+      tones[name] = rows[i].getAttribute('data-tone');
+    }
+    return { open: open, tones: tones };
+  }
+
+  function restore(before) {
+    var rows = board.querySelectorAll('details.tunnel');
+    for (var i = 0; i < rows.length; i++) {
+      var name = rows[i].getAttribute('data-profile');
+      if (before.open[name]) { rows[i].open = true; }
+      var tone = rows[i].getAttribute('data-tone');
+      if (before.tones[name] && before.tones[name] !== tone) {
+        rows[i].className += ' changed';
+      }
+    }
+  }
+
+  function stop() {
+    if (timer !== null) { window.clearInterval(timer); timer = null; }
+  }
+
+  function halt() {
+    paused = true;
+    stop();
+    if (pauser) { pauser.hidden = false; pauser.textContent = '继续'; }
+  }
+
+  function resume() {
+    if (timer === null) { timer = window.setInterval(refresh, every); }
+  }
+
+  function refresh() {
+    fetch(window.location.pathname + window.location.search, {cache: 'no-store'})
+      .then(function (response) {
+        if (response.ok) { return response.text(); }
+        if (response.status === 401 || response.status === 403) { throw 'auth'; }
+        throw 'http';
+      })
+      .then(function (text) {
+        var next = new DOMParser().parseFromString(text, 'text/html');
+        var nextBoard = next.getElementById('board');
+        var nextSummary = next.getElementById('summary');
+        if (!nextBoard || !nextSummary) { throw 'shape'; }
+        var before = snapshot();
+        board.innerHTML = nextBoard.innerHTML;
+        summary.innerHTML = nextSummary.innerHTML;
+        restore(before);
+        failures = 0;
+        say('ok', '已更新 ' + clock() + ' · 每 $refresh 秒');
+      })
+      .catch(function (why) {
+        if (why === 'auth') {
+          halt();
+          say('bad', '缺少令牌，无法自动刷新：在地址里带上 ?token=… 或手动刷新');
+          return;
+        }
+        failures += 1;
+        say('bad', '连接中断（第 ' + failures + ' 次），仍在重试');
+      });
+  }
+
+  if (pauser) {
+    pauser.hidden = false;
+    pauser.addEventListener('click', function () {
+      if (paused) {
+        paused = false;
+        pauser.textContent = '暂停';
+        resume();
+        refresh();
+      } else {
+        halt();
+        say('', '已暂停自动刷新，点“继续”恢复');
+      }
+    });
+  }
+  /* No point polling a tab nobody is looking at. */
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) { stop(); }
+    else if (!paused) { refresh(); resume(); }
+  });
+  resume();
+})();
+</script>
 </body>
 </html>
 """
@@ -617,16 +931,24 @@ def _pill(text: str, tone: str) -> str:
     return f'<span class="pill {tone}">{_esc(text)}</span>'
 
 
-def _health_pill(section: Mapping[str, Any]) -> str:
-    """The health pill of one profile."""
+def _tone(section: Mapping[str, Any]) -> str:
+    """The one verdict of a profile: ``ok`` / ``bad`` / ``unknown``.
+
+    The pill, the row's left bar and the header count all read it, so they can
+    never disagree about which tunnels are in trouble.
+    """
     healthy = section.get("healthy")
     if healthy is True:
-        return _pill("健康", "ok")
-    if healthy is False:
-        if _inconclusive(section):
-            return _pill("未知", "unknown")
-        return _pill("异常", "bad")
-    return _pill("未知", "unknown")
+        return "ok"
+    if healthy is False and not _inconclusive(section):
+        return "bad"
+    return "unknown"
+
+
+def _health_pill(section: Mapping[str, Any]) -> str:
+    """The health pill of one profile."""
+    tone = _tone(section)
+    return _pill({"ok": "健康", "bad": "异常", "unknown": "未知"}[tone], tone)
 
 
 def _kv(label: str, value: str) -> str:
@@ -639,12 +961,75 @@ def _row(label: str, value: Any) -> str:
     return _kv(label, _esc(value))
 
 
-def _port_rows(section: Mapping[str, Any]) -> str:
-    """Rows for the forwarded ``-R``/``-L``/``-D`` ports of one profile."""
-    rows: list[str] = []
-    for key, label in (("remote_ports", "远程端口"), ("local_ports", "本地端口")):
+#: The port groups a status section reports, and how the row labels them.
+#: ``-R`` ports live on the server, ``-L``/``-D`` ports on this machine.
+_PORT_GROUPS = (("remote_ports", "远程", "远程端口"), ("local_ports", "本地", "本地端口"))
+
+
+def _bar(ratio: float) -> str:
+    """A small availability bar: the same news as the digits, in one glance.
+
+    Thresholds are about what the number means for a tunnel that is supposed to
+    stay up, not about a uniform scale: a single reconnect in a day is worth
+    seeing, and half a day down is not the same colour as that.
+    """
+    width = max(0.0, min(1.0, ratio)) * 100
+    tone = "ok" if ratio >= 0.995 else ("warn" if ratio >= 0.95 else "bad")
+    return f'<span class="bar {tone}"><i style="width:{width:.1f}%"></i></span>'
+
+
+def _tile(count: int, label: str, tone: str) -> str:
+    """One header count (``tone`` is ``ok``/``unknown``/``bad``/empty)."""
+    return f'<div class="tile {tone}"><b>{count}</b><span>{_esc(label)}</span></div>'
+
+
+def _port_chips(section: Mapping[str, Any]) -> str:
+    """The forwarded ports of one tunnel, as chips in the row itself.
+
+    Every chip carries a glyph as well as a colour, because "which of these
+    ports is down" is the question the page exists to answer and colour alone
+    is not an answer for everyone reading it.
+
+    Unobserved is not the same as closed: when the probe could not run the
+    status file holds no port entries at all, so an empty row says
+    "未观测" rather than inventing a red "everything is down".
+    """
+    chips: list[str] = []
+    for key, short, _long in _PORT_GROUPS:
         ports = section.get(key)
-        if not isinstance(ports, Mapping) or not ports:
+        if not isinstance(ports, Mapping):
+            continue
+        for port, listening in sorted(ports.items(), key=_port_order):
+            tone, glyph = ("ok", "\u2713") if listening else ("bad", "\u2717")
+            chips.append(
+                f'<span class="chip {tone}">{glyph}'
+                f'<span class="k">{short}</span>{_esc(port)}</span>'
+            )
+        if key == "remote_ports" and not ports and section.get("probe_error"):
+            # Only the server-side group can go unobserved: a failed probe
+            # connection hides every ``-R`` port at once, while the ``-L``/``-D``
+            # listeners are probed in-process and reported whatever happens.
+            chips.append(
+                '<span class="chip unknown">?'
+                f'<span class="k">{short}</span>未观测</span>'
+            )
+    if chips:
+        return f'<div class="chips">{"".join(chips)}</div>'
+    if _inconclusive(section):
+        return '<div class="chips"><span class="chip unknown">端口未观测</span></div>'
+    return '<span class="muted">—</span>'
+
+
+def _port_rows(section: Mapping[str, Any]) -> str:
+    """The same ports spelled out in words, for the expanded detail."""
+    rows: list[str] = []
+    for key, _short, label in _PORT_GROUPS:
+        ports = section.get(key)
+        if not isinstance(ports, Mapping):
+            continue
+        if not ports:
+            if key == "remote_ports" and section.get("probe_error"):
+                rows.append(_kv(label, _pill("未观测", "unknown")))
             continue
         for port, listening in sorted(ports.items(), key=_port_order):
             rows.append(
@@ -690,19 +1075,74 @@ def _feed(section: Mapping[str, Any]) -> str:
     return "".join(lines)
 
 
-def _profile_card(name: str, section: Mapping[str, Any], *, now: float) -> str:
-    """One profile's card: identity, statistics, ports and event feed."""
-    healthy = section.get("healthy")
-    if healthy is True:
-        tone = "ok"
-    elif healthy is False and not _inconclusive(section):
-        tone = "bad"
-    else:
-        tone = "unknown"
+def _identity(name: str, section: Mapping[str, Any]) -> str:
+    """Who this tunnel is: its name, verdict, destination and jump chain."""
+    parts = [
+        f'<div class="title"><span class="name">{_esc(name)}</span>'
+        f"{_health_pill(section)}</div>"
+    ]
+    if section.get("destination"):
+        parts.append(f'<div class="target">{_esc(section["destination"])}</div>')
+    if section.get("jump"):
+        parts.append(
+            f'<div class="via" title="ssh -J">\u21b3 经 {_esc(section["jump"])}</div>'
+        )
+    return f'<div class="ident">{"".join(parts)}</div>'
+
+
+def _facts(section: Mapping[str, Any], *, now: float) -> str:
+    """The at-a-glance column: why it is down first, then session and uptime.
+
+    A reason the operator has to expand a row to discover is a reason they will
+    miss, so errors sit on the closed row itself.
+    """
+    lines: list[str] = []
+    # A conclusive failure is red; an unanswered probe is amber, because "we
+    # could not ask" is not the same news as "we asked and the answer was no".
+    for key, tone, label in (
+        ("error", "hi", "循环错误"),
+        ("health_error", "hi", "检查错误"),
+        ("probe_error", "warn", "探测失败"),
+    ):
+        if section.get(key):
+            lines.append(
+                f'<div class="{tone}">{_esc(label)}：{_esc(section[key])}</div>'
+            )
+
+    started = _as_float(section.get("current_session_at"))
+    session = (
+        "会话已断开"
+        if started is None
+        else f"会话 {_esc(_format_duration(now - started))}"
+    )
+    pieces = [session]
+    availability = _as_float(section.get("availability"))
+    if availability is not None:
+        pieces.append(f"在线率 {availability * 100:.1f}%{_bar(availability)}")
+    lines.append(f'<div>{" · ".join(pieces)}</div>')
+
+    at = _as_float(section.get("last_disconnect_at"))
+    if section.get("last_disconnect_reason") and at is not None:
+        lines.append(
+            f'<div>上次断线 {_esc(_format_duration(now - at))}前</div>'
+        )
+    return "".join(lines)
+
+
+def _panel(name: str, section: Mapping[str, Any], *, now: float) -> str:
+    """The expanded half of a row: every field the daemon recorded, in full.
+
+    Nothing is dropped from the compact row — it is only deferred, so the
+    overview stays one screen tall without becoming a summary of a summary.
+    """
     rows: list[str] = []
 
     if section.get("destination"):
         rows.append(_row("目标", section["destination"]))
+    if section.get("jump"):
+        rows.append(
+            _row("跳板机", f'{section["jump"]}（ssh -J，逐跳由 OpenSSH 自己建立）')
+        )
     if section.get("process_alive") is not None:
         rows.append(
             _kv(
@@ -768,43 +1208,82 @@ def _profile_card(name: str, section: Mapping[str, Any], *, now: float) -> str:
         rows.append(_row("循环错误", section["error"]))
 
     return (
-        f'<section class="card {tone}">'
-        f"<h2>{_esc(name)} {_health_pill(section)}</h2>"
-        f'<table class="kv">{"".join(rows)}</table>'
-        f'<h3>最近事件</h3><div class="feed">{_feed(section)}</div>'
-        f"</section>"
+        '<div class="panel">'
+        f'<div><h3>{_esc(name)} · 明细</h3>'
+        f'<table class="kv">{"".join(rows)}</table></div>'
+        f'<div><h3>最近事件</h3><div class="feed">{_feed(section)}</div></div>'
+        "</div>"
+    )
+
+
+def _tunnel(name: str, section: Mapping[str, Any], *, now: float) -> str:
+    """One tunnel: a closed row that answers the question, and its detail.
+
+    ``<details>`` rather than a link, so a browser that runs nothing still gets
+    the whole page. ``data-profile``/``data-tone`` are what the inline refresh
+    uses to put the open rows back and to spot a verdict that changed while
+    nobody was looking.
+    """
+    tone = _tone(section)
+    return (
+        f'<details class="tunnel {tone}" data-profile="{_esc(name)}"'
+        f' data-tone="{tone}">'
+        f'<summary class="grid">{_identity(name, section)}'
+        f'<div>{_port_chips(section)}</div>'
+        f'<div class="facts">{_facts(section, now=now)}</div>'
+        f'<div class="caret" title="展开明细"></div></summary>'
+        f"{_panel(name, section, now=now)}"
+        "</details>"
     )
 
 
 def _summary(payload: Mapping[str, Any], profiles: Mapping[str, Any]) -> str:
-    """The header line: overall state, pid, daemon uptime and profile count."""
+    """The header: the verdict, one tile per state that occurs, then daemon facts.
+
+    The counts are tiles rather than a sentence because "two of eleven" is read
+    from the page's shape long before any of the words are: a zero-count tile is
+    not rendered at all, so what is on screen is what needs attention.
+    """
     if not payload.get("running"):
         return _pill("守护进程未运行", "bad") + '<span class="muted">可执行 ponte start 启动</span>'
-    unhealthy = [
+    ok = [name for name, section in profiles.items() if section.get("healthy") is True]
+    broken = [
         name
         for name, section in profiles.items()
         if section.get("healthy") is False and not _inconclusive(section)
     ]
-    unknown = [name for name, section in profiles.items() if _inconclusive(section)]
-    if unhealthy:
-        overall = _pill(f"{len(unhealthy)}/{len(profiles)} 条隧道异常", "bad")
+    unknown = [name for name in profiles if name not in ok and name not in broken]
+    total = len(profiles)
+
+    if broken:
+        verdict = _pill(f"{len(broken)}/{total} 条隧道异常", "bad")
         if unknown:
-            overall += _pill(f"{len(unknown)} 条状态未知", "unknown")
-    elif unknown:
-        overall = _pill(f"{len(unknown)}/{len(profiles)} 条隧道状态未知", "unknown")
-    elif profiles and all(
-        section.get("healthy") is True for section in profiles.values()
-    ):
-        overall = _pill("全部健康", "ok")
+            verdict += _pill(f"{len(unknown)} 条状态未知", "unknown")
+    elif unknown and any(_inconclusive(profiles[name]) for name in unknown):
+        verdict = _pill(f"{len(unknown)}/{total} 条隧道状态未知", "unknown")
+    elif ok and len(ok) == total:
+        verdict = _pill("全部健康", "ok")
     else:
-        overall = _pill("等待首次检查", "unknown")
-    pieces = [overall]
+        verdict = _pill("等待首次检查", "unknown")
+
+    tiles = "".join(
+        _tile(count, label, tone)
+        for count, label, tone in (
+            (len(ok), "健康", "ok"),
+            (len(unknown), "未知", "unknown"),
+            (len(broken), "异常", "bad"),
+            (total, "隧道", ""),
+        )
+        if count
+    )
+    pieces = [verdict, f'<div class="tiles">{tiles}</div>' if tiles else ""]
     if payload.get("pid") is not None:
-        pieces.append(f'<span class="muted">pid {_esc(payload["pid"])}</span>')
+        pieces.append(f'<span class="meta">pid <b>{_esc(payload["pid"])}</b></span>')
     uptime = _as_float(payload.get("uptime_seconds"))
     if uptime is not None:
-        pieces.append(f'<span class="muted">守护进程运行 {_esc(_format_duration(uptime))}</span>')
-    pieces.append(f'<span class="muted">{len(profiles)} 条隧道</span>')
+        pieces.append(
+            f'<span class="meta">已运行 <b>{_esc(_format_duration(uptime))}</b></span>'
+        )
     return "".join(pieces)
 
 
@@ -818,27 +1297,33 @@ def dashboard_html(
     moment = time.time() if now is None else now
     profiles = _profiles(payload)
     if not payload.get("running"):
-        cards: list[str] = [
-            '<section class="card bad"><h2>守护进程未运行</h2>'
-            '<p class="muted">先执行 <code>ponte start</code> 启动隧道，'
-            "本页面会在下一轮自动刷新。</p></section>"
-        ]
+        board = (
+            '<section class="board"><div class="note"><h2>守护进程未运行</h2>'
+            "先执行 <code>ponte start</code> 启动隧道，本页面会在下一轮自动刷新。"
+            "</div></section>"
+        )
+    elif not profiles:
+        board = (
+            '<section class="board"><div class="note"><h2>尚无隧道上报</h2>'
+            "守护进程已启动，等待第一次健康检查。</div></section>"
+        )
     else:
-        cards = [
-            _profile_card(name, section, now=moment)
-            for name, section in profiles.items()
-        ]
-        if not cards:
-            cards = [
-                '<section class="card unknown"><h2>尚无隧道上报</h2>'
-                '<p class="muted">守护进程已启动，等待第一次健康检查。</p></section>'
-            ]
+        board = (
+            '<section class="board">'
+            '<div class="grid head"><div>隧道</div><div>端口</div>'
+            "<div>状态</div><div></div></div>"
+            + "".join(
+                _tunnel(name, section, now=moment)
+                for name, section in profiles.items()
+            )
+            + "</section>"
+        )
     return _PAGE.substitute(
         refresh=max(1, int(refresh)),
         version=_esc(__version__),
         title="隧道看板",
         summary=_summary(payload, profiles),
-        cards="".join(cards),
+        board=board,
     )
 
 

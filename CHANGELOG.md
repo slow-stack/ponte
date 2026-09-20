@@ -62,6 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pythonw.exe` sat next to `sys.executable`, the Scheduled Task quietly pointed
   at `python.exe` and a console window appeared at every logon. Installation now
   refuses with an actionable message instead of installing a task that pops up.
+- **A flapping tunnel was reported as 100% available.** `status --json` rounded
+  `availability` to one decimal *as a 0..1 ratio*, so 97.9% became `1.0` — and
+  that field is what the dashboard, `/status.json` and the Prometheus
+  `ponte_profile_availability_ratio` gauge all read, while `ponte status` printed
+  the truthful number from the unrounded value. The ratio is now rounded to
+  three decimals, which keeps the tenth of a percent those surfaces display.
 
 ### Changed
 
@@ -103,10 +109,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   taken from the config rather than the status file), shown as the first row of
   a `ponte status` table and included in `ponte status --json`. A table of
   numbers is useless if you cannot tell which server the broken one is; the
-  dashboard labels every card with it.
+  dashboard labels every row with it.
+- **The dashboard is one row per tunnel, not one card per tunnel.** Three
+  tunnels already needed a scroll, and the first requirement of a status page is
+  "see everything at once". Each row now carries the name and verdict, the
+  destination, the jump chain, the forwarded ports as chips, and one line of
+  session/availability/disconnect facts; the statistics table and the event feed
+  moved into the row's own `<details>` disclosure, so nothing was dropped — it is
+  only deferred. Port chips carry a glyph and a side label (`远程`/`本地`) rather
+  than relying on colour, and a row that is *unknown* shows `未观测` for the group
+  the probe never reached instead of a red `未监听`. The pill, the row's colour
+  bar and the header count all read one verdict helper, so they cannot disagree
+  about which tunnels are in trouble. The header also became a count of what is
+  actually wrong (a `0` tile is not rendered at all), and the page stopped being
+  dark-only: it now ships the light palette it had always advertised with
+  `<meta name="color-scheme" content="dark light">`, draws availability as a
+  small bar next to its digits, and uses tabular numerals so a number changing
+  under a refresh does not reflow the row it is in. (While building it: the
+  disclosure caret was written as a CSS `\25be` escape inside an ordinary Python
+  string, where Python reads `\25` as an *octal* escape — the caret rendered as a
+  control character.)
+- **The dashboard refreshes in place instead of reloading itself under you.**
+  The auto-refresh was a `<meta http-equiv="refresh">`, so every tick threw away
+  the page you were reading: an expanded row snapped shut, the scroll position
+  reset, and clicking a row could be undone before you finished reading it (on a
+  slow link it was worse than manual refreshing). The page is still rendered
+  complete on the server and still runs no script by default — the meta refresh
+  now lives inside `<noscript>`, so scripting off keeps exactly the old
+  behaviour, and a scripting browser never even creates that element. When a
+  script *is* running it fetches the same HTML and swaps the summary and the
+  board in place: expanded rows stay expanded (matched by profile name), the
+  scroll position does not move, and a row whose verdict changed since the
+  previous tick flashes, because a tunnel that dies between two refreshes should
+  be noticed rather than read as "it was always like that". It re-uses the
+  server's own rendering on purpose — a second renderer written in JavaScript is
+  exactly how a dashboard starts disagreeing with `ponte status`. The footer now
+  says which state it is in (`已更新 12:34:56 · 每 5 秒`, `已暂停`, or
+  `连接中断（第 N 次），仍在重试` instead of quietly showing a stale reading), a
+  `暂停` button stops polling while you read, polling stops by itself while the
+  tab is hidden, and a `401` says so instead of retrying forever.
 
 ### Added
 
+- **The jump chain is part of the status, next to the destination.**
+  `ProfileStatus.jump` carries the `ssh -J` value, so `ponte status --json` and
+  the dashboard can tell "cannot reach the server" apart from "cannot reach the
+  bastion" — the two failures ssh reports with the same message. The dashboard
+  prints `↳ 经 ops@bastion:2222` in amber on the row itself, because a bastion is
+  the link that fails first and the one nothing else in the config names.
 - **Jump hosts are a first-class setting: `[ssh] jump`.** "The server is only
   reachable through the bastion" is the most common real topology this kind of
   tool is pointed at, and it used to be unsupported in any discoverable way:

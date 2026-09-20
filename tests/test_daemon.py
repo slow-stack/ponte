@@ -1301,6 +1301,38 @@ def test_status_leaves_the_target_unknown_for_a_dropped_profile(tmp_path) -> Non
 
     assert ghost is not None
     assert ghost.destination is None
+    assert ghost.jump is None
+
+
+def test_status_carries_the_jump_chain_from_the_config(tmp_path) -> None:
+    """跳板机链也要从配置带进 status：否则看板上根本看不到它。
+
+    它是 *配置* 里的事实而不是状态文件里的事实，所以和 destination 一样，
+    在 daemon 刚重启、还没上报时就该已经能回答“经哪儿出去”。
+    """
+    from ponte.config import JumpHop
+
+    cfg = _two_profile_cfg(tmp_path)
+    profiles = [
+        dataclasses.replace(
+            profile,
+            ssh=dataclasses.replace(
+                profile.ssh,
+                jumps=(JumpHop(host="bastion", user="ops", port=2222),)
+                if profile.name == "web"
+                else (),
+            ),
+        )
+        for profile in cfg.profiles
+    ]
+    d = TunnelDaemon(dataclasses.replace(cfg, profiles=profiles))
+    _live_pid(tmp_path)
+    d._store.begin(["web", "db"], started_at=time.time())
+
+    s = d.status()
+
+    assert s.get_profile("web").jump == "ops@bastion:2222"
+    assert s.get_profile("db").jump is None, "没有跳板机的 profile 不得凭空多出一条链"
 
 
 # ---------------------------------------------------------------------------

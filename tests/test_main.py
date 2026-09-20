@@ -933,6 +933,63 @@ def test_status_json_includes_destination(monkeypatch) -> None:
     assert payload["profiles"]["default"]["destination"] == "testuser@example.com:22"
 
 
+def test_status_json_includes_the_jump_chain(monkeypatch) -> None:
+    """--json 里也要有跳板机：脚本得能区分“连不上服务器”与“连不上跳板机”。"""
+    import json as _json
+
+    s = _status(
+        ProfileStatus(
+            name="default",
+            destination="testuser@example.com:22",
+            jump="ops@bastion:2222",
+            healthy=True,
+        ),
+        running=True,
+        pid=7,
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    payload = _json.loads(result.output)
+    assert payload["profiles"]["default"]["jump"] == "ops@bastion:2222"
+
+
+def test_status_json_keeps_the_availability_precision(monkeypatch) -> None:
+    """在线率是 0..1 的比例，不能按秒数那样取整成 1.0。
+
+    0.9796 按“一位小数”舍入就是 1.0：一条半小时里断了 15 分钟的隧道会被
+    报成 100% 可用，而看板与 Prometheus 拿的都是这个值。
+    """
+    import json as _json
+
+    s = _status(
+        ProfileStatus(
+            name="default",
+            destination="testuser@example.com:22",
+            healthy=True,
+            tunnel_uptime_seconds=3600.0 * 12,
+            tunnel_downtime_seconds=900.0,
+        ),
+        running=True,
+        pid=7,
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    payload = _json.loads(result.output)
+    assert payload["profiles"]["default"]["availability"] == 0.98
+
+
 def test_config_ssh_command_prints_the_real_argv(monkeypatch) -> None:
     """--ssh-command 要把 ponte 真正会执行的命令行原样吐出来。"""
     monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())

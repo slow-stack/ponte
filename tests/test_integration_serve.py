@@ -62,6 +62,9 @@ def _config_path(tmp_path: Path, port: int) -> Path:
         'host = "example.com"\n'
         'user = "u"\n'
         f'identity_file = "{key.as_posix()}"\n'
+        # 跳板机写在配置里，而它到状态文件的路径跟 destination 一样：
+        # 看板要能显示“经哪台机器”，这条链就必须真能穿过去。
+        'jump = "ops@bastion:2222"\n'
         "\n[[tunnels]]\n"
         "remote_port = 23334\n"
         'local_host = "localhost"\n'
@@ -143,7 +146,13 @@ def test_unanswered_probe_stays_unknown_all_the_way_to_the_dashboard(tmp_path) -
         _, page = _get(port, f"/?token={token}")
         assert "未知" in page
         assert "异常" not in page
-        assert 'class="card unknown"' in page
+        assert 'class="tunnel unknown"' in page
+        # 配置里的跳板机一路活到了 HTML 上，而不是只活在 config 里。
+        assert "↳ 经 ops@bastion:2222" in page
+        assert "?<span class=\"k\">远程</span>未观测</span>" in page, (
+            "没观测到的端口不得画成“未监听”"
+        )
+        assert "✗" not in page
     finally:
         server.shutdown()
         server.server_close()

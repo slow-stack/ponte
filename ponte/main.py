@@ -416,10 +416,24 @@ def _round1(value: float | None) -> float | None:
     return None if value is None else round(value, 1)
 
 
+def _round_ratio(value: float | None) -> float | None:
+    """Round an availability *ratio* for JSON output, ``None`` through.
+
+    Three decimals rather than one: this is a 0..1 fraction, so rounding it the
+    way the second counts are rounded collapses 97.9% into 100.0% and reports a
+    flapping tunnel as perfect. Three decimals keeps the tenth of a percent that
+    ``ponte status`` and the dashboard print.
+    """
+    return None if value is None else round(value, 3)
+
+
 def _profile_payload(profile) -> dict:  # noqa: ANN001 - ProfileStatus cycle guard
     """Machine-readable snapshot of one profile (the ``--json`` contract)."""
     return {
         "destination": profile.destination,
+        # The jump chain (``ssh -J``), so a dashboard or a script can tell
+        # "cannot reach the server" apart from "cannot reach the bastion".
+        "jump": profile.jump,
         "healthy": profile.healthy,
         "process_alive": profile.process_alive,
         "health_error": profile.health_error,
@@ -436,7 +450,7 @@ def _profile_payload(profile) -> dict:  # noqa: ANN001 - ProfileStatus cycle gua
         "reconnects_total": profile.reconnects_total,
         "tunnel_uptime_seconds": _round1(profile.tunnel_uptime_seconds),
         "tunnel_downtime_seconds": _round1(profile.tunnel_downtime_seconds),
-        "availability": _round1(profile.availability),
+        "availability": _round_ratio(profile.availability),
         "current_session_at": profile.current_session_at,
         "last_disconnect_at": profile.last_disconnect_at,
         "last_disconnect_reason": profile.last_disconnect_reason,

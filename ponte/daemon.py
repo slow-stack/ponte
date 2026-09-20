@@ -335,6 +335,12 @@ class ProfileStatus:
     #: ``status --json`` / dashboard row self-describing: a table of numbers is
     #: useless if you cannot tell which server is the broken one.
     destination: str | None = None
+    #: The jump chain (``ssh -J`` value, e.g. ``ops@bastion:2222``) this profile
+    #: reaches :attr:`destination` through, taken from the configuration like
+    #: :attr:`destination` is. Kept next to it because a tunnel that only exists
+    #: behind a bastion fails for a reason the destination alone cannot name:
+    #: ``ssh`` reports a dead hop and a refused login with the same message.
+    jump: str | None = None
     #: ``None`` until the first health check of this profile reports in.
     healthy: bool | None = None
     process_alive: bool | None = None
@@ -446,7 +452,11 @@ class DaemonStatus:
 
 
 def _profile_status(
-    name: str, section: dict, *, destination: str | None = None
+    name: str,
+    section: dict,
+    *,
+    destination: str | None = None,
+    jump: str | None = None,
 ) -> ProfileStatus:
     """Build a :class:`ProfileStatus` from one status-file section.
 
@@ -485,6 +495,7 @@ def _profile_status(
     return ProfileStatus(
         name=name,
         destination=destination,
+        jump=jump,
         healthy=raw_healthy if isinstance(raw_healthy, bool) else None,
         process_alive=raw_alive if isinstance(raw_alive, bool) else None,
         remote_ports=_ports("remote_ports"),
@@ -1523,6 +1534,12 @@ class TunnelDaemon:
         destinations = {
             profile.name: profile.destination for profile in self.config.profiles
         }
+        # Same origin as the destination: the config as the *running* daemon read
+        # it, so a jump chain added to the file is not shown until the reload
+        # that actually puts it on the command line.
+        jumps = {
+            profile.name: profile.ssh.proxy_jump for profile in self.config.profiles
+        }
         return DaemonStatus(
             running=True,
             pid=pid,
@@ -1530,7 +1547,10 @@ class TunnelDaemon:
             uptime_seconds=max(0.0, uptime),
             profiles=[
                 _profile_status(
-                    name, sections.get(name, {}), destination=destinations.get(name)
+                    name,
+                    sections.get(name, {}),
+                    destination=destinations.get(name),
+                    jump=jumps.get(name),
                 )
                 for name in names
             ],

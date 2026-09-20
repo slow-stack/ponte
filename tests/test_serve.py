@@ -240,12 +240,19 @@ def test_metrics_do_not_call_an_unanswered_probe_a_failure() -> None:
 
 
 def test_dashboard_shows_unknown_with_its_reason() -> None:
-    """看板卡片必须是“未知”，不能是红色“异常”。"""
-    page = dashboard_html(_payload(profiles={"web": _unanswered()}), now=_NOW)
+    """看板行必须是“未知”，不能是红色“异常”，也不能谎称端口全关。"""
+    page = dashboard_html(
+        _payload(profiles={"web": _unanswered(local_ports={})}),
+        now=_NOW,
+    )
     assert "未知" in page
     assert "异常" not in page
     assert "探测失败（端口状态未知）" in page
-    assert 'class="card unknown"' in page
+    assert 'class="tunnel unknown"' in page
+    # 没观测到的端口不该被画成“未监听”：那是把“问不到”报成了坏消息。
+    assert '<span class="chip unknown">?<span class="k">远程</span>未观测</span>' in page
+    assert "✗" not in page
+    assert "未监听" not in page
 
 
 def test_healthz_degraded_explains_a_closed_port_without_an_error_string() -> None:
@@ -426,6 +433,137 @@ def test_dashboard_shows_the_tunnel_state() -> None:
     assert "监听中" in page and "未监听" in page
     assert "ssh exited with code 255" in page
     assert '<meta http-equiv="refresh" content="7">' in page
+
+
+def test_dashboard_shows_the_jump_chain_next_to_the_destination() -> None:
+    """跳板机必须看得见：它是链路里最先断、也最难自己查出来的一环。"""
+    page = dashboard_html(
+        _payload(profiles={"web": _profile(jump="ops@bastion.corp:2222")}),
+        now=_NOW,
+    )
+    assert "↳ 经 ops@bastion.corp:2222" in page
+    assert "跳板机" in page  # 明细里也写明它交给 ssh -J
+
+    without = dashboard_html(_payload(), now=_NOW)
+    assert "↳" not in without, "没有跳板机就不该画出这一行"
+
+
+def test_dashboard_labels_every_port_chip_with_side_and_state() -> None:
+    """端口 chips 要同时说清“哪一侧”和“开没开”，不能只靠颜色。"""
+    page = dashboard_html(
+        _payload(
+            profiles={
+                "web": _profile(
+                    remote_ports={"23334": True, "8080": False},
+                    local_ports={"1080": True},
+                )
+            }
+        ),
+        now=_NOW,
+    )
+    assert '<span class="chip ok">✓<span class="k">远程</span>23334</span>' in page
+    assert '<span class="chip bad">✗<span class="k">远程</span>8080</span>' in page
+    assert '<span class="chip ok">✓<span class="k">本地</span>1080</span>' in page
+
+
+def test_dashboard_folds_the_detail_into_a_closed_row() -> None:
+    """一行一隧道：默认只有一行高，所有统计与事件流收在 <details> 里。"""
+    page = dashboard_html(_payload(), now=_NOW)
+    assert page.count('<details class="tunnel ok" data-profile="web" data-tone="ok">') == 1
+    row, _, panel = page.partition("</summary>")
+    assert "会话统计" not in row  # 概览行不背统计表
+    assert "最近事件" not in row
+    assert "会话统计" in panel  # 但它一个字都没丢
+    assert "最近事件" in panel
+    assert "2m 0s" in row  # 概览行只留一条会话时长
+
+
+def test_dashboard_reloads_without_script_and_refreshes_in_place_with_it() -> None:
+    """无脚本时靠 <noscript> 里的 meta 整页刷新；有脚本时原地换同一份服务端 HTML。"""
+    page = dashboard_html(_payload(), refresh=7, now=_NOW)
+    assert '<noscript><meta http-equiv="refresh" content="7"></noscript>' in page
+    # 脚本里不能有第二份渲染逻辑：只把服务端的那份 HTML fetch 回来换进去。
+    assert "var every = 7 * 1000;" in page
+    assert "getElementById('board')" in page and "getElementById('summary')" in page
+    assert "<script src=" not in page, "看板不得依赖任何外部资源"
+
+
+def test_dashboard_counts_only_the_states_that_occur() -> None:
+    """头部只画真正出现的状态：0 不占位，免得一眼扫过去全是 0。"""
+    healthy = dashboard_html(
+        _payload(profiles={"web": _profile(), "db": _profile()}), now=_NOW
+    )
+    assert '<div class="tile ok"><b>2</b><span>健康</span></div>' in healthy
+    assert '<div class="tile unknown">' not in healthy
+    assert '<div class="tile bad">' not in healthy
+    assert '<span>隧道</span>' in healthy
+
+    mixed = dashboard_html(
+        _payload(
+            profiles={
+                "web": _profile(),
+                "db": _unanswered(local_ports={}),
+                "off": _profile(healthy=False),
+            }
+        ),
+        now=_NOW,
+    )
+    assert "1/3 条隧道异常" in mixed
+    assert "1 条状态未知" in mixed
+    assert '<div class="tile bad"><b>1</b><span>异常</span></div>' in mixed
+
+
+def test_dashboard_draws_the_availability_as_a_bar() -> None:
+    """在线率除了数字还有形状：一道 40px 的条比一串小数快得多。"""
+    page = dashboard_html(
+        _payload(profiles={"web": _profile(availability=0.998)}), now=_NOW
+    )
+    assert '<span class="bar ok"><i style="width:99.8%"></i></span>' in page
+
+    nearly_down = dashboard_html(
+        _payload(profiles={"web": _profile(availability=0.12)}), now=_NOW
+    )
+    assert '<span class="bar bad"><i style="width:12.0%"></i></span>' in nearly_down
+
+
+def test_dashboard_puts_the_reason_on_the_closed_row() -> None:
+    """出错原因要在收起的那一行上：需要点开才看得到的原因等于没有。"""
+    page = dashboard_html(
+        _payload(
+            profiles={
+                "web": _profile(
+                    healthy=False,
+                    error="RuntimeError: retry loop died",
+                    health_error="process check failed: TimeoutExpired",
+                )
+            }
+        ),
+        now=_NOW,
+    )
+    row, _, panel = page.partition("</summary>")
+    assert "循环错误：RuntimeError: retry loop died" in row
+    assert "检查错误：process check failed: TimeoutExpired" in row
+    assert "循环错误" in panel and "检查错误" in panel  # 明细里也有一份
+
+
+def test_dashboard_admits_a_port_group_it_could_not_look_at() -> None:
+    """整组端口都没被看过时，说的是“未观测”，而不是画成“未监听”。"""
+    page = dashboard_html(
+        _payload(
+            profiles={
+                "web": _profile(
+                    healthy=False,
+                    health_conclusive=False,
+                    health_error="process check failed: OSError",
+                    remote_ports={},
+                    local_ports={},
+                )
+            }
+        ),
+        now=_NOW,
+    )
+    assert '<span class="chip unknown">端口未观测</span>' in page
+    assert "未监听" not in page
 
 
 def test_dashboard_escapes_everything_from_outside() -> None:
