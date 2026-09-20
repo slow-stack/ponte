@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from typing import Any, cast
 from xml.sax.saxutils import escape as xml_escape
 
 from ponte.config import (
@@ -193,6 +194,20 @@ def _decode_console(data: bytes) -> str:
         return data.decode("gbk", errors="replace")
 
 
+def _windows_kernel32() -> Any:
+    """Return the ``kernel32`` handle used by the Windows process probes.
+
+    typeshed declares ``ctypes.windll`` for Windows only, so accessing it
+    directly makes ``mypy`` fail with ``attr-defined`` on Linux — which is where
+    CI runs the type check. The cast states the actual situation: the attribute
+    is always there at runtime, but only the Windows stubs know about it. Both
+    callers are Windows-only, so this never runs where ``windll`` is missing.
+    """
+    import ctypes
+
+    return cast(Any, ctypes).windll.kernel32
+
+
 def _windows_exit_code(pid: int) -> int | None:
     """Return *pid*'s exit code, or ``None`` when the handle cannot be opened.
 
@@ -204,7 +219,7 @@ def _windows_exit_code(pid: int) -> int | None:
     import ctypes
 
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _windows_kernel32()
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
     if not handle:
         return None
@@ -245,7 +260,7 @@ def _windows_process_listed(pid: int) -> bool | None:
             ("szExeFile", ctypes.c_char * 260),
         ]
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _windows_kernel32()
     # Without these, a 64-bit snapshot handle is truncated to 32 bits on return.
     kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
     kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]

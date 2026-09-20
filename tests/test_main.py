@@ -1051,8 +1051,16 @@ def test_doctor_json_reports_failures_and_exits_nonzero(monkeypatch) -> None:
     )
 
 
-def test_shell_completion_script_is_available() -> None:
-    """add_completion=True：--show-completion 真的能生成补全脚本。"""
-    result = CliRunner().invoke(app, ["--show-completion", "bash"])
+def test_shell_completion_script_is_available(monkeypatch) -> None:
+    """add_completion=True：--show-completion 按指定的 shell 生成补全脚本。
+
+    必须先关掉 shell 自动探测。探测可用时 typer 会把 --show-completion 变成一个
+    不接受取值的开关，shell 改由父进程链探测决定——在 CI 里（macOS runner 的父
+    进程链里没有能识别的 shell）探测结果不在 typer 的脚本表里，命令直接以 1 退
+    出。关掉探测后取值才真正生效，各平台结果一致；这里要 zsh 而不是 bash，是为
+    了证明用的是参数而不是探测结果。
+    """
+    monkeypatch.setenv("_TYPER_COMPLETE_TEST_DISABLE_SHELL_DETECTION", "1")
+    result = CliRunner().invoke(app, ["--show-completion", "zsh"])
     assert result.exit_code == 0
-    assert "completion" in result.output.lower()
+    assert "#compdef" in result.output
