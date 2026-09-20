@@ -34,10 +34,11 @@ _PROBE_START_DELAY = "1.0"
 #: 写过（``tests/test_core.py`` 里"给 drain 线程 50ms"）。用 ``-c`` 而不是落盘文件：
 #: 子进程的启动成本要压在零点几秒，否则这条自检本身就成了套件里最慢的东西。
 #:
-#: 它的报错文本故意用 ASCII：子进程继承套件当时的环境，而在非 UTF-8 的机器上（CI 真
-#: 有这种腿，见 ci.yml），一句中文连 stderr 都写不出去——那时这个自检自己就成了它想
-#: 找的那类环境依赖。（不是猜测：本仓就是在 ``PYTHONIOENCODING=ascii`` 下把这条测试
-#: 弄红过。）
+#: 里面的字符**全部是 ASCII**（包括注释），这不是风格问题，是被 CI 实测出来的：非 UTF-8
+#: 的机器上（C locale 腿，见 ci.yml）文件系统编码就是 ASCII，中文连 stderr 都写不出去，
+#: 而作为 ``-c`` 的参数更直接——前一句注释曾让 ``os.posix_spawn`` 抛
+#: ``UnicodeEncodeError: 'ascii' codec ...``：**argv 根本传不进去**。那时这个自检自己就
+#: 成了它想找的那类环境依赖。
 _NAP_PROBE = '''
 import os
 import threading
@@ -45,7 +46,7 @@ import time
 
 import _injection
 
-_injection.active()  # 子进程自己装上负载注入，按环境变量决定装什么
+_injection.active()  # install the injection from this child's environment
 
 seen = []
 
