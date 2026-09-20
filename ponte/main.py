@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shlex
 import sys
 import time
 import webbrowser
@@ -29,11 +30,16 @@ from rich.table import Table
 from ponte import __version__
 from ponte.config import (
     ConfigError,
+    DaemonConfig,
     ServeConfig,
+    TunnelConfig,
+    daemon_paths_from_file,
     get_config,
     init_config,
+    load_config,
     set_config_path,
 )
+from ponte.core import ProbeError
 from ponte.daemon import _format_duration
 from ponte.doctor import FAIL, OK, SKIP, WARN, counts, run_checks
 from ponte.serve import create_server, serve_url
@@ -67,7 +73,8 @@ app = typer.Typer(
     no_args_is_help=True,
     invoke_without_command=True,
     help="管理 SSH 反向隧道守护进程的命令行工具",
-    add_completion=False,
+    # 生成 shell 补全（bash/zsh/fish/PowerShell）：ponte --install-completion
+    add_completion=True,
 )
 console = Console()
 err_console = Console(stderr=True)
@@ -115,6 +122,40 @@ def _daemon() -> TunnelDaemon:
     from ponte.daemon import TunnelDaemon
 
     return TunnelDaemon(config=get_config())
+
+
+def _control_daemon() -> TunnelDaemon:
+    """A daemon handle for the control/observe commands (stop/status/logs/watch).
+
+    Those commands need only the pid/log paths, so they must survive a config
+    that no longer validates: one bad line in a tunnel rule should never leave
+    a user unable to stop the daemon they need to stop. When the strict load
+    fails we recover just ``[daemon]`` from the raw TOML and carry on, saying
+    so on stderr (stdout stays clean for ``status --json``).
+
+    ``start``/``restart``/``install`` deliberately do *not* use this: starting
+    from a broken config should still fail, and ``restart`` must fail *before*
+    it stops anything.
+    """
+    from ponte.daemon import TunnelDaemon
+
+    try:
+        # Delegating to ``_daemon()`` keeps a single injection point: tests and
+        # callers that replace ``ponte.main._daemon`` still control this path.
+        return _daemon()
+    except ConfigError as exc:
+        pid_file, log_file = daemon_paths_from_file()
+        first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else "配置无效"
+        err_console.print(
+            f"[yellow]配置无法解析（{escape(first_line)}），"
+            "已仅按 [daemon] 路径定位守护进程[/yellow]"
+        )
+        return TunnelDaemon(
+            config=TunnelConfig(
+                profiles=[],
+                daemon=DaemonConfig(pid_file=pid_file, log_file=log_file),
+            )
+        )
 
 
 def _fail(message: str) -> NoReturn:
@@ -173,7 +214,7 @@ def start(
 def stop() -> None:
     """停止反向隧道守护进程。"""
     try:
-        daemon = _daemon()
+        daemon = _control_daemon()
         if not daemon.status().running:
             console.print("[grey]未运行[/grey]")
             raise typer.Exit(code=0)
@@ -182,6 +223,35 @@ def stop() -> None:
         kill_msg = _force_kill_message(result)
         if kill_msg:
             console.print(f"[yellow]{escape(kill_msg)}[/yellow]")
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(str(exc))
+
+
+@app.command()
+def reload() -> None:
+    """重载配置：只重启真的改过的隧道，其它连接不中断。"""
+    try:
+        daemon = _daemon()
+        # 先在本进程把新配置解析一遍：写错了要立刻告诉用户，
+        # 而不是让守护进程读到坏配置后把正在跑的隧道一起拆掉。
+        source = daemon.config.source_path
+        if source:
+            try:
+                fresh = load_config(source)
+            except ConfigError as exc:
+                _fail(f"配置有问题，未发送重载请求（守护进程继续用旧配置）：{exc}")
+            for warning in fresh.warnings:
+                console.print(f"[yellow]警告：{escape(warning)}[/yellow]")
+
+        if not daemon.status().running:
+            console.print("[grey]未运行（可 ponte start 启动）[/grey]")
+            raise typer.Exit(code=0)
+
+        daemon.request_reload()
+        console.print("[green]已请求重载[/green]")
+        console.print("[dim]配置未变的隧道不会中断；结果见 ponte logs -f[/dim]")
     except typer.Exit:
         raise
     except Exception as exc:
@@ -224,7 +294,7 @@ def status(
 ) -> None:
     """查看守护进程与各隧道健康状态（每条隧道一行）。"""
     try:
-        s = _daemon().status()
+        s = _control_daemon().status()
         if not s.running:
             if json_output:
                 console.print_json(json.dumps({"running": False}))
@@ -270,13 +340,20 @@ def _status_table(title: str) -> Table:
     return table
 
 
-def _markup_health(healthy: bool | None, error: str | None) -> str:
-    """Render a health flag, with the probe error when there is one."""
+def _markup_health(
+    healthy: bool | None, error: str | None, conclusive: bool | None = None
+) -> str:
+    """Render a health flag, with the probe error when there is one.
+
+    A check that never got to ask (``conclusive is False``) is *未知*, not
+    异常: a failed probe connection says nothing about the tunnel, and painting
+    it red is how a healthy tunnel gets "fixed" until it breaks.
+    """
     if healthy is True:
         return "[green]健康[/green]"
-    if healthy is None:
-        return "[yellow]未知[/yellow]"
     detail = escape(error or "")
+    if healthy is None or conclusive is False:
+        return "[yellow]未知[/yellow]" + (f"（{detail}）" if detail else "")
     return "[red]异常[/red]" + (f"（{detail}）" if detail else "")
 
 
@@ -295,7 +372,14 @@ def _add_profile_rows(table: Table, profile) -> None:  # noqa: ANN001 - cycle gu
     # 目标放在第一行：多条隧道时，最先要说清的是“这张表是哪个服务器”。
     if profile.destination:
         table.add_row("目标", escape(profile.destination))
-    table.add_row("健康状态", _markup_health(profile.healthy, profile.health_error))
+    table.add_row(
+        "健康状态",
+        _markup_health(
+            profile.healthy,
+            profile.probe_error or profile.health_error,
+            profile.health_conclusive,
+        ),
+    )
 
     # 会话时长是区分“守护进程活了多久”与“隧道活了多久”的那一列。
     if profile.current_session_at is not None:
@@ -332,13 +416,32 @@ def _round1(value: float | None) -> float | None:
     return None if value is None else round(value, 1)
 
 
+def _round_ratio(value: float | None) -> float | None:
+    """Round an availability *ratio* for JSON output, ``None`` through.
+
+    Three decimals rather than one: this is a 0..1 fraction, so rounding it the
+    way the second counts are rounded collapses 97.9% into 100.0% and reports a
+    flapping tunnel as perfect. Three decimals keeps the tenth of a percent that
+    ``ponte status`` and the dashboard print.
+    """
+    return None if value is None else round(value, 3)
+
+
 def _profile_payload(profile) -> dict:  # noqa: ANN001 - ProfileStatus cycle guard
     """Machine-readable snapshot of one profile (the ``--json`` contract)."""
     return {
         "destination": profile.destination,
+        # The jump chain (``ssh -J``), so a dashboard or a script can tell
+        # "cannot reach the server" apart from "cannot reach the bastion".
+        "jump": profile.jump,
         "healthy": profile.healthy,
         "process_alive": profile.process_alive,
         "health_error": profile.health_error,
+        # ``healthy: false`` with ``health_conclusive: false`` means the check
+        # could not be completed — the ports below are empty because they were
+        # never observed, not because they were found closed.
+        "health_conclusive": profile.health_conclusive,
+        "probe_error": profile.probe_error,
         "error": profile.error,
         "remote_ports": {str(p): ok for p, ok in profile.remote_ports.items()},
         "local_ports": {str(p): ok for p, ok in profile.local_ports.items()},
@@ -347,7 +450,7 @@ def _profile_payload(profile) -> dict:  # noqa: ANN001 - ProfileStatus cycle gua
         "reconnects_total": profile.reconnects_total,
         "tunnel_uptime_seconds": _round1(profile.tunnel_uptime_seconds),
         "tunnel_downtime_seconds": _round1(profile.tunnel_downtime_seconds),
-        "availability": _round1(profile.availability),
+        "availability": _round_ratio(profile.availability),
         "current_session_at": profile.current_session_at,
         "last_disconnect_at": profile.last_disconnect_at,
         "last_disconnect_reason": profile.last_disconnect_reason,
@@ -399,7 +502,7 @@ def logs(
 ) -> None:
     """查看守护进程日志（默认只看尾部，-f 跟随）。"""
     try:
-        log_file = _daemon().log_file
+        log_file = _control_daemon().log_file
         if not os.path.isfile(log_file):
             console.print("[yellow]尚无日志（daemon 从未启动？）[/yellow]")
             raise typer.Exit(code=0)
@@ -471,7 +574,14 @@ def _render_profile_feed(profile) -> RenderableType:  # noqa: ANN001 - cycle gua
 def _render_profile_watch(profile) -> RenderableType:  # noqa: ANN001 - cycle guard
     """One profile's dashboard block: statistics grid + event feed."""
     table = Table.grid(padding=(0, 2))
-    table.add_row("健康状态", _markup_health(profile.healthy, profile.health_error))
+    table.add_row(
+        "健康状态",
+        _markup_health(
+            profile.healthy,
+            profile.probe_error or profile.health_error,
+            profile.health_conclusive,
+        ),
+    )
 
     if profile.current_session_at is not None:
         table.add_row(
@@ -551,7 +661,7 @@ def watch(
     ),
 ) -> None:
     """实时看板：在终端里持续刷新隧道健康与会话统计。"""
-    daemon = _daemon()
+    daemon = _control_daemon()
     try:
         with Live(
             _render_watch(daemon.status()),
@@ -705,7 +815,14 @@ def check(
         any_port = False
         for name in names:
             label = "" if len(names) == 1 else f"{name} "
-            remote = daemon.check_remote_ports(timeout=timeout, profile=name)
+            try:
+                remote = daemon.check_remote_ports(timeout=timeout, profile=name)
+            except ProbeError as exc:
+                # 探测连接没建起来 → 未知，不是“未监听”；也不能因为一条 profile
+                # 探不到就让其余 profile 的结果看不到。
+                console.print(f"{label}远程端口: [yellow]未知[/yellow]（{escape(str(exc))}）")
+                any_port = True
+                remote = {}
             local = daemon.check_local_ports(profile=name)
             for port, ok in sorted(remote.items()):
                 any_port = True
@@ -730,6 +847,9 @@ def check(
 def doctor(
     offline: bool = typer.Option(False, "--offline", help="跳过需要网络/SSH 的检查"),
     timeout: int = typer.Option(5, "--timeout", help="SSH 连通性测试超时（秒）"),
+    json_output: bool = typer.Option(
+        False, "--json", help="以 JSON 输出体检结果（供脚本 / CI 消费）"
+    ),
 ) -> None:
     """一键体检：配置、密钥、连通性、端口、自启与通知，逐项给结论与修法。"""
     try:
@@ -747,6 +867,33 @@ def doctor(
         daemon = None
 
     checks = run_checks(cfg, daemon, offline=offline, timeout=timeout)
+    tally = counts(checks)
+
+    if json_output:
+        # 与表格同一份结论，只是给脚本一个稳定的结构；退出码照样反映失败，
+        # 这样 CI 里既能把报告存下来，又可以直接用 if 判断。
+        console.print_json(
+            json.dumps(
+                {
+                    "ok": tally[FAIL] == 0,
+                    "counts": tally,
+                    "checks": [
+                        {
+                            "name": check.name,
+                            "status": check.status,
+                            "detail": check.detail,
+                            "hint": check.hint,
+                        }
+                        for check in checks
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+        if tally[FAIL]:
+            raise typer.Exit(code=1)
+        return
+
     table = Table(title="ponte doctor", header_style="bold cyan")
     table.add_column("检查", no_wrap=True, style="cyan")
     table.add_column("结论", no_wrap=True)
@@ -767,7 +914,6 @@ def doctor(
         )
     console.print(table)
 
-    tally = counts(checks)
     console.print(
         f"通过 {tally[OK]} · 注意 {tally[WARN]} · "
         f"失败 {tally[FAIL]} · 跳过 {tally[SKIP]}"
@@ -838,11 +984,39 @@ def uninstall() -> None:
         _fail(str(exc))
 
 
+def _print_ssh_commands(cfg: TunnelConfig) -> None:
+    """Print the exact ``ssh`` argv ponte runs, one line per profile.
+
+    The config is a description; this is the command. It answers "what does
+    ponte actually execute?" without guessing — especially useful now that
+    omitting ``user``/``identity_file`` hands those decisions to OpenSSH.
+    """
+    from ponte.core import TunnelManager
+
+    multiple = len(cfg.profiles) > 1
+    for profile in cfg.profiles:
+        if multiple:
+            console.print(f"{escape(profile.name)}：", markup=False)
+        console.print(
+            shlex.join(TunnelManager(cfg, profile).build_args()),
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+
+
 @app.command()
-def config() -> None:
+def config(
+    ssh_command: bool = typer.Option(
+        False, "--ssh-command", help="只打印实际会执行的 ssh 命令（逐条隧道）"
+    ),
+) -> None:
     """打印当前生效的配置关键项。"""
     try:
         cfg = get_config()
+        if ssh_command:
+            _print_ssh_commands(cfg)
+            return
         retry = cfg.retry
         health = cfg.health
 
@@ -853,10 +1027,15 @@ def config() -> None:
         multiple = len(cfg.profiles) > 1
         for profile in cfg.profiles:
             prefix = f"{profile.name} · " if multiple else ""
-            table.add_row(
-                f"{prefix}服务器", f"{profile.ssh.user}@{profile.ssh.host}"
-            )
+            # ``destination`` (not ``user@host``) so an omitted user prints as
+            # the bare host it actually passes to ssh.
+            table.add_row(f"{prefix}服务器", escape(profile.destination))
             table.add_row(f"{prefix}SSH 端口", str(profile.ssh.port))
+            if profile.ssh.proxy_jump:
+                table.add_row(
+                    f"{prefix}跳板机",
+                    escape(profile.ssh.proxy_jump) + "（ssh -J，逐跳由 OpenSSH 自己建立）",
+                )
             tunnel_lines = [
                 t.summary + (f"  ({escape(t.description)})" if t.description else "")
                 for t in profile.tunnels
@@ -925,7 +1104,8 @@ def init(
     console.print(
         "[dim]请填写 "
         + escape("[ssh]")
-        + " 的 host / user / identity_file，然后运行 ponte test[/dim]"
+        + " 的 host（user / identity_file 可省略，省略即复用 ~/.ssh/config），"
+        "然后运行 ponte test[/dim]"
     )
     console.print(
         "[dim]换其它配置文件：ponte --config <path> … 或设置 PONTE_CONFIG[/dim]"

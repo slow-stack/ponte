@@ -17,9 +17,26 @@ import time
 
 from ponte.config import WILDCARD_HOSTS, Profile, TunnelConfig, get_config
 
-__all__ = ["TunnelManager", "creation_flags"]
+__all__ = ["ProbeError", "TunnelManager", "port_is_open", "creation_flags"]
 
 logger = logging.getLogger(__name__)
+
+#: Seconds a killed probe gets to release its stdout pipe before we give up on
+#: reading it (see :func:`_run_capture`).
+_PROBE_KILL_GRACE = 2.0
+
+
+class ProbeError(RuntimeError):
+    """A probe could not be completed, so what it inspects is *unknown*.
+
+    The distinction this exception exists for is "the probe ran and the answer
+    was no" versus "the probe never got to ask". Only the first is evidence
+    that a tunnel is down, and callers must not turn the second into a down
+    verdict: a probe *connection* fails for reasons that say nothing about the
+    tunnel (a shared/NATed uplink, provider-side connection rate limiting, a
+    session reset), and reporting those as a closed port is how a health
+    monitor ends up killing perfectly healthy tunnels.
+    """
 
 
 def creation_flags() -> int:
@@ -54,6 +71,58 @@ _WINDOWS_SSH_FALLBACKS = (
     r"C:\Program Files (x86)\Git\usr\bin\ssh.exe",
     r"C:\Windows\System32\OpenSSH\ssh.exe",
 )
+
+
+def _run_capture(args: list[str], timeout: float) -> tuple[int | None, str]:
+    """Run *args* and return ``(returncode, stdout)`` without ever stalling.
+
+    Deliberately not ``subprocess.run``. On Windows that helper, once its
+    *timeout* fires, kills the child and then blocks in ``communicate()``
+    joining the stdout reader thread — and that join only returns when *every*
+    write end of the pipe is closed. A long-lived process holding an inherited
+    duplicate of the handle keeps the pipe open forever, so the call never
+    comes back and neither does its timeout.
+
+    That is not hypothetical: it froze the daemon's health monitor for hours
+    while the tunnel itself was fine, because the first probe's pipe had been
+    inherited by the SSH tunnel child (see :meth:`TunnelManager.connect`). The
+    status file then sat on its last reading, ``ponte status`` kept saying
+    "异常", and zombie-session recovery — which runs off health ticks — never
+    fired at all.
+
+    So the read is bounded twice: ``communicate(timeout)`` for the normal path,
+    then a *short* second ``communicate`` after the kill. If even that fails to
+    return (the handle is genuinely wedged elsewhere), give up on the output
+    rather than on the caller: ``(None, "")`` reads as "probe failed", which is
+    the conservative answer for both callers.
+    """
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        # stderr is not read by either caller; DEVNULL avoids a second pipe.
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        close_fds=True,
+        creationflags=creation_flags(),
+    )
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, out or ""
+    except subprocess.TimeoutExpired:
+        logger.debug("probe timed out after %ss; killing %s", timeout, args[0])
+        proc.kill()
+        try:
+            out, _ = proc.communicate(timeout=_PROBE_KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "probe pipe never closed after kill (leaked handle?); "
+                "reporting the probe as failed",
+            )
+            return None, ""
+        return proc.returncode, out or ""
 
 
 def _windows_ssh_fallbacks() -> list[str]:
@@ -148,9 +217,15 @@ class TunnelManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            # POSIX defaults to closing fds on exec; Windows deliberately keeps
-            # the inherited console handles so CREATE_NO_WINDOW keeps working.
-            close_fds=(sys.platform != "win32"),
+            # ``close_fds`` must stay on *even on Windows*. This child is
+            # long-lived (hours), and on Windows an inheriting child keeps a
+            # copy of every handle that is inheritable at spawn time. Windows
+            # has no close-on-exec, so a sibling's pipe write end inherited
+            # here outlives that sibling: whoever reads the pipe (e.g. the
+            # health probe's ``communicate()``) then never sees EOF and blocks
+            # forever. Suppressing a console window is the job of
+            # ``creationflags`` below, not of handle inheritance.
+            close_fds=True,
             creationflags=creation_flags(),
         )
         self._connected_at = time.monotonic()
@@ -230,17 +305,16 @@ class TunnelManager:
 
     # -- Argument building --------------------------------------------------
 
-    def build_args(self) -> list[str]:
-        """Construct the full SSH command line as a list of strings.
+    def _connection_args(self, *, connect_timeout: int | None = None) -> list[str]:
+        """Return the ``ssh`` invocation prefix that reaches the server.
 
-        Every configured :class:`~ponte.config.Tunnel` contributes exactly one
-        forwarding flag followed by its spec, so a mixed ``-R``/``-L``/``-D``
-        set becomes a single connection. Example::
-
-            ["ssh", "-o", "ServerAliveInterval=30", "-N",
-             "-R", "23334:localhost:2222",
-             "-L", "127.0.0.1:8080:db.internal:5432",
-             "-D", "127.0.0.1:1080", "user@server-ip"]
+        Every path that talks to the server — the tunnel itself, the login test
+        the health loop and ``ponte test`` use, and the server-side port probe —
+        starts from this one list. They each used to build it themselves, which
+        is how a setting could reach the tunnel but not the checks that
+        supervise it; ``[ssh] jump`` (``-J``) would have been exactly such a
+        setting: the tunnel would come up through the bastion while every health
+        check declared it dead.
         """
         cfg = self.profile.ssh
         args = [self.ssh_exe]
@@ -253,12 +327,40 @@ class TunnelManager:
         if cfg.known_hosts_file:
             args.extend(["-o", f"UserKnownHostsFile={cfg.known_hosts_file}"])
 
-        # Identity file
-        args.extend(["-i", cfg.identity_file])
+        # Identity file. Optional: without it OpenSSH falls back to
+        # ~/.ssh/config, ssh-agent and its default key locations, which is how
+        # a machine whose plain ``ssh host`` already works stays that way.
+        if cfg.identity_file:
+            args.extend(["-i", cfg.identity_file])
+
+        # Jump host(s). Handed to OpenSSH as -J rather than tunnelled by ponte:
+        # ssh opens (and authenticates) the hop itself, so the bastion's own
+        # user/key come from ~/.ssh/config just like the destination's do.
+        if cfg.proxy_jump:
+            args.extend(["-J", cfg.proxy_jump])
 
         # Port
         if cfg.port != 22:
             args.extend(["-p", str(cfg.port)])
+
+        if connect_timeout is not None:
+            args.extend(["-o", f"ConnectTimeout={connect_timeout}"])
+
+        return args
+
+    def build_args(self) -> list[str]:
+        """Construct the full SSH command line as a list of strings.
+
+        Every configured :class:`~ponte.config.Tunnel` contributes exactly one
+        forwarding flag followed by its spec, so a mixed ``-R``/``-L``/``-D``
+        set becomes a single connection. Example::
+
+            ["ssh", "-o", "ServerAliveInterval=30", "-N",
+             "-R", "23334:localhost:2222",
+             "-L", "127.0.0.1:8080:db.internal:5432",
+             "-D", "127.0.0.1:1080", "user@server-ip"]
+        """
+        args = self._connection_args()
 
         # No shell, just forwarding
         args.append("-N")
@@ -268,41 +370,26 @@ class TunnelManager:
             args.extend([tunnel.flag, tunnel.spec])
 
         # Destination
-        args.append(cfg.destination)
+        args.append(self.profile.ssh.destination)
         return args
 
     # -- Health / diagnostics -----------------------------------------------
 
     def test_connection(self, timeout: int = 10) -> bool:
-        """Run a quick ``ssh … echo OK`` to verify connectivity.        Returns
-            ``True`` if the server responds with "OK".
+        """Run a quick ``ssh … echo OK`` to verify connectivity.
+
+        Returns ``True`` if the server responds with "OK". Goes through the
+        configured jump host, so this is the check that validates a *chain*
+        rather than only its last link.
         """
-        cfg = self.profile.ssh
-        args = [self.ssh_exe]
-        for key, value in cfg.options.as_pairs():
-            args.extend(["-o", f"{key}={value}"])
-        if cfg.known_hosts_file:
-            args.extend(["-o", f"UserKnownHostsFile={cfg.known_hosts_file}"])
-        args.extend(["-i", cfg.identity_file])
-        if cfg.port != 22:
-            args.extend(["-p", str(cfg.port)])
-        args.extend([
-            "-o", f"ConnectTimeout={timeout}",
-            cfg.destination,
-            "echo OK",
-        ])
+        args = self._connection_args(connect_timeout=timeout)
+        args.extend([self.profile.ssh.destination, "echo OK"])
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=timeout + 5,
-                creationflags=creation_flags(),
-            )
-            return result.returncode == 0 and "OK" in result.stdout
+            code, output = _run_capture(args, timeout=timeout + 5)
         except (subprocess.SubprocessError, OSError) as exc:
             logger.debug("Connection test failed: %s", exc)
             return False
+        return code == 0 and "OK" in output
 
     def check_remote_ports(self, timeout: int = 10) -> dict[int, bool]:
         """Connect to the server and check which ``-R`` ports are listening.
@@ -315,6 +402,12 @@ class TunnelManager:
         ``-L``/``-D`` rules are skipped here (their local end is covered by the
         far cheaper :meth:`check_local_ports`). Returns ``{}`` — never a probe
         connection — when no remote tunnel is configured.
+
+        Raises:
+            ProbeError: the probe connection itself failed (ssh could not be
+                spawned, exited non-zero, or its output never arrived), so the
+                ports' state is *unknown* rather than closed. Every port in the
+                returned mapping was actually observed on the server.
         """
         cfg = self.profile.ssh
         ports = {
@@ -349,32 +442,25 @@ class TunnelManager:
             "fi"
         )
 
-        args = [self.ssh_exe]
-        for key, value in cfg.options.as_pairs():
-            args.extend(["-o", f"{key}={value}"])
-        if cfg.known_hosts_file:
-            args.extend(["-o", f"UserKnownHostsFile={cfg.known_hosts_file}"])
-        args.extend(["-i", cfg.identity_file])
-        if cfg.port != 22:
-            args.extend(["-p", str(cfg.port)])
-        args.extend([
-            "-o", f"ConnectTimeout={timeout}",
-            cfg.destination,
-            remote_cmd,
-        ])
+        args = self._connection_args(connect_timeout=timeout)
+        args.extend([cfg.destination, remote_cmd])
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=timeout + 5,
-                creationflags=creation_flags(),
-            )
+            code, output = _run_capture(args, timeout=timeout + 5)
         except (subprocess.SubprocessError, OSError) as exc:
-            logger.debug("Remote port check failed: %s", exc)
-            return {p: False for p in ports}
+            logger.debug("Remote port check could not run: %s", exc)
+            raise ProbeError(
+                f"探测连接失败（{exc}）：{port_literal} 的状态未知"
+            ) from exc
+        if code != 0:
+            # ssh itself failed — auth, a connection reset, provider rate
+            # limiting, or our own timeout kill. The check command never ran,
+            # so nothing was learned about the ports. Reporting them closed
+            # here is what turns a flaky probe into a forced reconnect.
+            logger.debug("Remote port check: ssh exited %s", code)
+            raise ProbeError(
+                f"探测连接失败（ssh 退出码 {code}）：{port_literal} 的状态未知"
+            )
 
-        output = result.stdout or ""
         # python3 branch prints the open ports space-separated on one line.
         python_ports = {int(p) for p in output.split() if p.isdigit()}
         status: dict[int, bool] = {}
@@ -404,12 +490,16 @@ class TunnelManager:
             host = tunnel.local_host
             if host in WILDCARD_HOSTS:
                 host = "127.0.0.1"
-            status[tunnel.local_port] = _port_is_open(host, tunnel.local_port, timeout)
+            status[tunnel.local_port] = port_is_open(host, tunnel.local_port, timeout)
         return status
 
 
-def _port_is_open(host: str, port: int, timeout: float) -> bool:
-    """Return ``True`` if a TCP connect to ``host:port`` succeeds."""
+def port_is_open(host: str, port: int, timeout: float) -> bool:
+    """Return ``True`` if a TCP connect to ``host:port`` succeeds.
+
+    Public because ``ponte doctor`` probes a jump host with exactly this — the
+    one question a bastion check can answer locally.
+    """
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True

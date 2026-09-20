@@ -16,17 +16,28 @@ import types
 
 import pytest
 
-from ponte.config import Profile, SSHConfig, Tunnel, TunnelConfig, WindowsConfig
+import ponte.daemon as daemon
+from ponte.config import (
+    Profile,
+    SSHConfig,
+    Tunnel,
+    TunnelConfig,
+    WindowsConfig,
+    load_config,
+)
 from ponte.core import creation_flags
 from ponte.daemon import (
     DaemonStatus,
     ProfileRunner,
     TunnelDaemon,
     _decode_console,
+    _derive_reload_marker,
     _derive_status_file,
     _derive_stop_marker,
     _encode_ps,
     _run_tool,
+    _windows_pid_alive,
+    _windows_process_listed,
 )
 from ponte.health import HealthStatus
 from ponte.retry import RetryEvent
@@ -105,6 +116,92 @@ def test_write_read_pid(tmp_path) -> None:
 def test_read_pid_missing(tmp_path) -> None:
     d = TunnelDaemon(_cfg(tmp_path))
     assert d.read_pid() is None
+
+
+# ---------------------------------------------------------------------------
+# Windows 进程存活判定 —— 非提权用户看不到 SYSTEM 守护进程
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_win32_uses_the_exit_code_when_openable(monkeypatch) -> None:
+    """能拿到句柄时以退出码为准：259 是 STILL_ACTIVE，其它就是已退出。"""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("ponte.daemon._windows_exit_code", lambda _pid: 259)
+    assert TunnelDaemon._pid_alive(4321) is True
+
+    monkeypatch.setattr("ponte.daemon._windows_exit_code", lambda _pid: 1)
+    assert TunnelDaemon._pid_alive(4321) is False
+
+
+def test_pid_alive_win32_falls_back_when_openprocess_is_denied(monkeypatch) -> None:
+    """ACCESS_DENIED（SYSTEM 身份跑着的守护进程）不能当成“没在跑”。
+
+    误报“未运行”的代价很具体：ponte start 会再拉一个守护进程抢同一对服务器端口，
+    ponte stop 则拒绝停掉真正在跑的那个。
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("ponte.daemon._windows_exit_code", lambda _pid: None)
+
+    monkeypatch.setattr("ponte.daemon._windows_process_listed", lambda _pid: True)
+    assert TunnelDaemon._pid_alive(4321) is True
+
+    # 进程真的不在了：同样拿不到句柄，但进程列表里找不到。
+    monkeypatch.setattr("ponte.daemon._windows_process_listed", lambda _pid: False)
+    assert TunnelDaemon._pid_alive(4321) is False
+
+
+def test_pid_alive_win32_assumes_alive_when_it_cannot_tell(monkeypatch) -> None:
+    """连进程列表都拿不到时宁可报“活着”：多拦一次 start 好过起两个守护进程。"""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("ponte.daemon._windows_exit_code", lambda _pid: None)
+    monkeypatch.setattr("ponte.daemon._windows_process_listed", lambda _pid: None)
+    assert TunnelDaemon._pid_alive(4321) is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_windows_process_listed_sees_a_real_process() -> None:
+    """真实调用 Toolhelp32（64 位下快照句柄很容易被截断，这里守住）。"""
+    assert _windows_process_listed(os.getpid()) is True
+    assert _windows_process_listed(2**31 - 1) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_windows_pid_alive_reports_a_dead_pid_as_dead() -> None:
+    """不存在的 pid 必须判定为已退出（否则 ponte start 永远拒绝启动）。"""
+    assert _windows_pid_alive(os.getpid()) is True
+    assert _windows_pid_alive(2**31 - 1) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_windows_pid_alive_sees_an_account_it_cannot_open() -> None:
+    """SYSTEM 跑着的进程，本用户拿不到句柄，也必须判为“活着”。
+
+    这正是 ponte 在 Windows 推荐的部署：守护进程以 SYSTEM 开机即起，
+    status / stop 却由登录用户执行——拿不到句柄就报“未运行”的话，
+    ponte start 会再起一个守护进程抢同一对端口。
+    """
+    import subprocess
+
+    import ponte.daemon as daemon_module
+
+    out = subprocess.run(
+        ["tasklist", "/FI", "USERNAME eq SYSTEM", "/NH", "/FO", "CSV"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).stdout
+    pid = None
+    for line in out.splitlines():
+        parts = [part.strip('"') for part in line.split('","')]
+        if len(parts) >= 2 and parts[1].isdigit():
+            pid = int(parts[1])
+            break
+    if pid is None:
+        pytest.skip("no SYSTEM process to inspect")
+    if daemon_module._windows_exit_code(pid) is not None:
+        pytest.skip("this session can open SYSTEM processes (elevated?)")
+    assert _windows_pid_alive(pid) is True
 
 
 def test_status_not_running(tmp_path) -> None:
@@ -209,9 +306,12 @@ def test_cleanup_removes_pid_and_marker(tmp_path) -> None:
     d.write_pid()
     with open(d.stop_marker, "w", encoding="utf-8") as fh:
         fh.write("x")
+    with open(d.reload_marker, "w", encoding="utf-8") as fh:
+        fh.write("x")
     d._cleanup()
     assert not os.path.exists(cfg.daemon.pid_file)
     assert not os.path.exists(d.stop_marker)
+    assert not os.path.exists(d.reload_marker)
 
 
 def _windows_path_semantics(monkeypatch, *, executable: str, existing: set[str]) -> None:
@@ -433,6 +533,17 @@ def _healthy_status() -> HealthStatus:
     )
 
 
+def _unknown_status() -> HealthStatus:
+    """探测连接失败：没观察到端口，因此也没有“未监听”的结论。"""
+    return HealthStatus(
+        process_alive=True,
+        remote_ports={},
+        all_healthy=False,
+        timestamp=time.time(),
+        remote_probe_error="探测连接失败（ssh 退出码 255）：23334 的状态未知",
+    )
+
+
 def test_on_health_forces_reconnect_after_threshold(tmp_path) -> None:
     """连续 N 次 unhealthy 且进程活着 → manager.stop() 被调用，触发后计数归零。"""
     cfg = _cfg(tmp_path)
@@ -484,6 +595,66 @@ def test_on_health_does_not_force_reconnect_when_process_dead(tmp_path) -> None:
     for _ in range(5):
         d._on_health(_unhealthy_status(process_alive=False), manager)
     assert manager.stop_calls == 0
+
+
+def test_on_health_unknown_never_forces_reconnect(tmp_path) -> None:
+    """未知状态无论多少次都不触发强制重连。
+
+    共享/NAT 出口下探测连接失败率很高（实测约 30%），若把它计入阈值，
+    监视器会在一条完全健康的隧道上反复开工。“没问到”永远不是证据。
+    """
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    manager = _FakeManager()
+
+    for _ in range(20):
+        d._on_health(_unknown_status(), manager)
+    assert manager.stop_calls == 0
+    assert d._health_failures.get("default", 0) == 0
+
+
+def test_on_health_unknown_does_not_reset_conclusive_failures(tmp_path) -> None:
+    """未知不清零计数器：真假死在夹杂探测失败时仍要被抓到。"""
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    manager = _FakeManager()
+
+    d._on_health(_unhealthy_status(), manager)
+    d._on_health(_unhealthy_status(), manager)
+    d._on_health(_unknown_status(), manager)  # 不计入，也不清零
+    assert manager.stop_calls == 0
+    assert d._health_failures["default"] == 2
+
+    d._on_health(_unhealthy_status(), manager)  # 第三次“确凿”失败 → 触发
+    assert manager.stop_calls == 1
+
+
+def test_on_health_persists_the_unknown_mark(tmp_path) -> None:
+    """显示层靠这两个字段区分“未知”与“异常”，所以它们必须落到状态文件。"""
+    from ponte.daemon import _profile_status
+
+    d = TunnelDaemon(_cfg(tmp_path))
+    d._on_health(_unknown_status())
+    section = _section(d)
+    assert section["healthy"] is False
+    assert section["health_conclusive"] is False
+    assert "255" in section["probe_error"]
+    assert section["remote_ports"] == {}, "没观察到的端口不得写成“未监听”"
+
+    # 读回来同样保留这两个字段（"未知"必须能穿过状态文件活到 CLI）。
+    status = _profile_status("default", section)
+    assert status.healthy is False
+    assert status.health_conclusive is False
+    assert status.probe_error and "255" in status.probe_error
+
+
+def test_on_health_persists_conclusive_mark(tmp_path) -> None:
+    """确凿失败仍然写成“可判定”，否则重连逻辑就永远不会触发。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    d._on_health(_unhealthy_status())
+    section = _section(d)
+    assert section["health_conclusive"] is True
+    assert section["probe_error"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +1040,31 @@ def test_work_dir_is_config_directory_not_package_parent(tmp_path) -> None:
     assert TunnelDaemon(cfg).work_dir == str(tmp_path)
 
 
+def test_work_dir_leaves_the_package_directory(monkeypatch, tmp_path) -> None:
+    """旧布局（配置就放在包目录里）不能拿包目录当工作目录。
+
+    那里 `python -m ponte.main` 根本导入不到包：sys.path 上需要的是包的**父目录**。
+    子进程会秒死， ponte start 只报“未写 PID 文件”，ponte install 则注册一个
+    永远起不来的任务。
+    """
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr("ponte.daemon.package_dir", lambda: str(pkg))
+    cfg = dataclasses.replace(_cfg(tmp_path), source_path=str(pkg / "config.toml"))
+    assert TunnelDaemon(cfg).work_dir == str(tmp_path)
+
+
+def test_spawn_failure_includes_what_the_child_said(tmp_path) -> None:
+    """子进程什么也没说时，报错要把它残留的输出带上，而不是只给一个超时。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    os.makedirs(os.path.dirname(d.pid_file), exist_ok=True)
+    with open(d.pid_file + ".spawn.log", "wb") as handle:
+        handle.write(b"ModuleNotFoundError: No module named 'ponte'\n")
+
+    assert "ModuleNotFoundError" in daemon._spawn_tail(d.pid_file + ".spawn.log")
+    assert daemon._spawn_tail(str(tmp_path / "missing.log")) == ""
+
+
 def test_work_dir_falls_back_to_home(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -1105,3 +1301,215 @@ def test_status_leaves_the_target_unknown_for_a_dropped_profile(tmp_path) -> Non
 
     assert ghost is not None
     assert ghost.destination is None
+    assert ghost.jump is None
+
+
+def test_status_carries_the_jump_chain_from_the_config(tmp_path) -> None:
+    """跳板机链也要从配置带进 status：否则看板上根本看不到它。
+
+    它是 *配置* 里的事实而不是状态文件里的事实，所以和 destination 一样，
+    在 daemon 刚重启、还没上报时就该已经能回答“经哪儿出去”。
+    """
+    from ponte.config import JumpHop
+
+    cfg = _two_profile_cfg(tmp_path)
+    profiles = [
+        dataclasses.replace(
+            profile,
+            ssh=dataclasses.replace(
+                profile.ssh,
+                jumps=(JumpHop(host="bastion", user="ops", port=2222),)
+                if profile.name == "web"
+                else (),
+            ),
+        )
+        for profile in cfg.profiles
+    ]
+    d = TunnelDaemon(dataclasses.replace(cfg, profiles=profiles))
+    _live_pid(tmp_path)
+    d._store.begin(["web", "db"], started_at=time.time())
+
+    s = d.status()
+
+    assert s.get_profile("web").jump == "ops@bastion:2222"
+    assert s.get_profile("db").jump is None, "没有跳板机的 profile 不得凭空多出一条链"
+
+
+# ---------------------------------------------------------------------------
+# 配置热重载：ponte reload / SIGHUP
+# ---------------------------------------------------------------------------
+
+
+class _RecordingRunner:
+    """``ProfileRunner`` stand-in for reload tests: records lifecycle, no SSH."""
+
+    instances: list[_RecordingRunner] = []
+
+    def __init__(self, profile, config, daemon, **_kwargs) -> None:
+        self.profile = profile
+        self.notifier = daemon.notifier
+        self.started = False
+        self.finished = False
+        _RecordingRunner.instances.append(self)
+
+    def start(self) -> None:
+        self.started = True
+
+    def abort(self) -> None:
+        pass
+
+    def finish(self) -> None:
+        self.finished = True
+
+    def is_alive(self) -> bool:
+        return self.started and not self.finished
+
+
+def _write_profiles(
+    tmp_path, specs, *, extra: str = ""
+) -> TunnelConfig:
+    """Write a profiles-layout config (real key file) and return it loaded.
+
+    *specs* is an iterable of ``(name, host)`` pairs, so a test can change just
+    one endpoint and prove only that profile is restarted.
+    """
+    key = tmp_path / "id_rsa"
+    key.write_text("x", encoding="utf-8")
+    blocks = ""
+    for name, host in specs:
+        blocks += f"""
+[[profiles]]
+name = "{name}"
+  [profiles.ssh]
+  host = "{host}"
+  user = "u"
+  identity_file = "{key.as_posix()}"
+  [[profiles.tunnels]]
+  remote_port = 23334
+  local_host = "localhost"
+  local_port = 2222
+"""
+    # pid/log must live in tmp_path: the platform default state dir belongs to
+    # the real user, and these tests would otherwise read each other's status
+    # files (and touch the operator's own).
+    daemon_section = (
+        "[daemon]\n"
+        f'pid_file = "{(tmp_path / "ponte.pid").as_posix()}"\n'
+        f'log_file = "{(tmp_path / "ponte.log").as_posix()}"\n'
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(extra + daemon_section + blocks, encoding="utf-8")
+    return load_config(str(path))
+
+
+def _reload_daemon(tmp_path, monkeypatch, specs):
+    """A daemon whose runners are recording stubs, one per *specs* entry."""
+    _RecordingRunner.instances = []
+    monkeypatch.setattr("ponte.daemon.ProfileRunner", _RecordingRunner)
+    cfg = _write_profiles(tmp_path, specs)
+    d = TunnelDaemon(cfg)
+    d._runners = [_RecordingRunner(p, cfg, d) for p in cfg.profiles]
+    for runner in d._runners:
+        runner.start()
+    return d
+
+
+def test_derive_reload_marker_from_pid() -> None:
+    assert _derive_reload_marker(r"C:\x\ponte.pid") == r"C:\x\ponte.reload"
+
+
+def test_request_reload_writes_marker(tmp_path) -> None:
+    """请求重载只写标记文件（跨进程），由守护进程自己消费。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    assert not os.path.exists(d.reload_marker)
+    d.request_reload()
+    assert os.path.exists(d.reload_marker)
+
+
+def test_reconcile_keeps_unchanged_profiles(tmp_path, monkeypatch) -> None:
+    """配置没变的隧道重载后还是同一个 runner——连接不会被打断。"""
+    d = _reload_daemon(
+        tmp_path, monkeypatch, (("web", "web.example.com"), ("db", "db.example.com"))
+    )
+    before = list(d._runners)
+
+    summary = d._reconcile()
+
+    assert d._runners == before
+    assert all(not runner.finished for runner in before)
+    assert "保持 2 条" in summary
+
+
+def test_reconcile_restarts_only_the_changed_profile(tmp_path, monkeypatch) -> None:
+    """改一台服务器只重启那一条，其余（含新增）各归各位。"""
+    d = _reload_daemon(
+        tmp_path, monkeypatch, (("web", "web.example.com"), ("db", "db.example.com"))
+    )
+    old = {runner.profile.name: runner for runner in d._runners}
+
+    # web 换了一台机器，db 原样，另加一条 cache。
+    _write_profiles(
+        tmp_path,
+        (
+            ("web", "web2.example.com"),
+            ("db", "db.example.com"),
+            ("cache", "cache.example.com"),
+        ),
+    )
+    summary = d._reconcile()
+
+    current = {runner.profile.name: runner for runner in d._runners}
+    assert list(current) == ["web", "db", "cache"]  # 顺序跟随配置
+    assert current["db"] is old["db"] and not old["db"].finished
+    assert current["web"] is not old["web"] and old["web"].finished
+    assert current["cache"].started
+    assert "重启/新增" in summary
+    assert set(d._store.read_profiles()) == {"web", "db", "cache"}
+
+
+def test_reconcile_removes_profiles_that_left_the_config(tmp_path, monkeypatch) -> None:
+    """配置里删掉的隧道要停掉，状态文件里也不再残留它的旧健康数据。"""
+    d = _reload_daemon(
+        tmp_path, monkeypatch, (("web", "web.example.com"), ("db", "db.example.com"))
+    )
+    old = {runner.profile.name: runner for runner in d._runners}
+
+    _write_profiles(tmp_path, (("web", "web.example.com"),))
+    summary = d._reconcile()
+
+    assert [runner.profile.name for runner in d._runners] == ["web"]
+    assert old["db"].finished
+    assert "移除 1 条" in summary
+    assert set(d._store.read_profiles()) == {"web"}
+
+
+def test_reconcile_rebuilds_everything_when_policy_changes(tmp_path, monkeypatch) -> None:
+    """retry/health 是写进 runner 的策略，改了就必须整条重建。"""
+    d = _reload_daemon(
+        tmp_path, monkeypatch, (("web", "web.example.com"), ("db", "db.example.com"))
+    )
+    old = {runner.profile.name: runner for runner in d._runners}
+
+    _write_profiles(
+        tmp_path,
+        (("web", "web.example.com"), ("db", "db.example.com")),
+        extra="[retry]\nbase_delay = 7\n",
+    )
+    summary = d._reconcile()
+
+    assert all(old[name].finished for name in old)
+    assert all(runner is not old[runner.profile.name] for runner in d._runners)
+    assert "retry/health" in summary
+
+
+def test_reconcile_keeps_running_config_on_a_broken_file(tmp_path, monkeypatch) -> None:
+    """配置文件写坏了必须原地保留：一个笔误不能把正在跑的隧道拆掉。"""
+    d = _reload_daemon(tmp_path, monkeypatch, (("web", "web.example.com"),))
+    before = list(d._runners)
+
+    (tmp_path / "config.toml").write_text("not = toml = =", encoding="utf-8")
+    summary = d._reconcile()
+
+    assert "重载失败" in summary
+    assert d._runners == before
+    assert not before[0].finished

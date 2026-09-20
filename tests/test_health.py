@@ -8,6 +8,7 @@ import time
 import pytest
 
 from ponte.config import HealthConfig
+from ponte.core import ProbeError
 from ponte.health import HealthChecker, HealthStatus
 
 
@@ -22,10 +23,17 @@ class _Proc:
 class _TM:
     """A TunnelManager stand-in exposing ``process`` + ``check_remote_ports``."""
 
-    def __init__(self, alive: bool = True, ports: str = "dict", fail_ports: bool = False) -> None:
+    def __init__(
+        self,
+        alive: bool = True,
+        ports: str = "dict",
+        fail_ports: bool = False,
+        probe_error: str | None = None,
+    ) -> None:
         self._proc = _Proc(alive)
         self.ports = ports
         self.fail_ports = fail_ports
+        self.probe_error = probe_error
         self._timeout: int | None = None
 
     @property
@@ -34,6 +42,8 @@ class _TM:
 
     def check_remote_ports(self, **kw) -> object:
         self._timeout = kw.get("timeout")
+        if self.probe_error is not None:
+            raise ProbeError(self.probe_error)
         if self.fail_ports:
             raise ConnectionError("refused")
         if self.ports == "dict":
@@ -78,6 +88,65 @@ def test_port_check_failure() -> None:
     s = hc.check()
     assert s.all_healthy is False
     assert s.error is not None and "ConnectionError" in s.error
+
+
+# ---------------------------------------------------------------------------
+# 探测失败 = 未知，而不是“端口挂了”
+# ---------------------------------------------------------------------------
+
+
+def test_failed_probe_connection_reports_unknown_ports() -> None:
+    """探针连接建不起来 → ``remote_ports`` 为空（没观察到），并标记为不确定。
+
+    以前这里会得到 ``{23334: False, 17897: False}``：同一份快照既骗显示
+    （“未监听”），又让守护进程在连续三次后强杀一条健康的隧道。
+    """
+    hc = HealthChecker(
+        _TM(alive=True, probe_error="ssh 退出码 255：23334 的状态未知"), _hc()
+    )
+    s = hc.check()
+    assert s.remote_ports == {}
+    assert s.remote_probe_error is not None and "255" in s.remote_probe_error
+    assert s.all_healthy is False
+    assert s.conclusive is False
+    assert "unknown" in str(s)
+    assert "conclusive=False" in str(s)
+
+
+def test_a_probe_that_ran_still_speaks_definitively() -> None:
+    """探针跑通了并看到端口关着 → 这是判定（可告警、可触发重连），不是未知。"""
+    s = HealthChecker(_TM(alive=True, ports="dict"), _hc()).check()
+    assert s.remote_ports == {23334: True, 17897: False}
+    assert s.remote_probe_error is None
+    assert s.conclusive is True
+
+
+def test_a_dead_process_is_conclusive_even_without_a_probe() -> None:
+    """进程已经退出：无需探针也知道隧道是断的，不能因为探针失败而含糊。"""
+    s = HealthStatus(
+        process_alive=False,
+        remote_ports={},
+        all_healthy=False,
+        timestamp=time.time(),
+        remote_probe_error="探测连接失败（refused）",
+    )
+    assert s.conclusive is True
+
+
+def test_an_unexpected_subcheck_failure_is_not_conclusive() -> None:
+    """非 ProbeError 的意外异常同样不构成“隧道挂了”的证据。"""
+    s = HealthChecker(_TM(alive=True, ports="dict", fail_ports=True), _hc()).check()
+    assert s.all_healthy is False
+    assert s.error is not None and "ConnectionError" in s.error
+    assert s.conclusive is False
+
+
+def test_an_inconclusive_check_still_backs_off() -> None:
+    """未知同样算“没健康”：退避是对的（路径限速时最不该做的是继续猛探）。"""
+    assert HealthChecker._backoff_interval(60.0, 1, 300.0) == 120.0
+    hc = HealthChecker(_TM(alive=True, probe_error="probe down"), _hc())
+    s = hc.check()
+    assert s.all_healthy is False  # 因此 run_loop 会退避
 
 
 def test_remote_check_disabled() -> None:

@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from ponte import __version__
 from ponte.config import (
     HealthConfig,
+    JumpHop,
     Profile,
     RetryConfig,
     ServeConfig,
@@ -90,10 +91,15 @@ def test_version_option() -> None:
 
 
 def test_config_command(monkeypatch) -> None:
-    monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
+    cfg = _cfg()
+    monkeypatch.setattr("ponte.main.get_config", lambda: cfg)
     result = CliRunner().invoke(app, ["config"])
     assert result.exit_code == 0
-    assert "example.com" in result.output
+    # 比配置里的值，而不是拿域名字面量做子串包含：那种写法在源码里正是一次
+    # “不完整的地址校验”（CodeQL 的 py/incomplete-url-substring-sanitization 报的
+    # 就是它，在这里属于误报 — 但那个形状本身不该留在代码里），换成配置里的值
+    # 之后，断言也真的钉住了“印出来的就是配的那台服务器”。
+    assert cfg.profiles[0].destination in result.output
     assert "23334" in result.output
     assert "pid_file" in result.output
 
@@ -178,6 +184,74 @@ def test_status_json_running(monkeypatch) -> None:
     )
 
 
+def test_status_json_marks_an_unanswered_check_as_unknown(monkeypatch) -> None:
+    """``healthy=false`` 但 ``health_conclusive=false``：脚本能分清“未知”与“坏了”。"""
+    import json as _json
+
+    s = _status(
+        ProfileStatus(
+            name="default",
+            healthy=False,
+            health_conclusive=False,
+            probe_error="探测连接失败（ssh 退出码 255）：23334 的状态未知",
+            remote_ports={},
+        ),
+        running=True,
+        pid=4321,
+        uptime_seconds=60.0,
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+
+    payload = _json.loads(result.output)
+    profile = payload["profiles"]["default"]
+    assert profile["healthy"] is False
+    assert profile["health_conclusive"] is False
+    assert "255" in profile["probe_error"]
+    assert profile["remote_ports"] == {}, "没观察到的端口不得写成“未监听”"
+
+
+def test_markup_health_separates_unknown_from_broken() -> None:
+    """显示层：无法判定的检查是黄色“未知”，不是红色“异常”。"""
+    from ponte.main import _markup_health
+
+    assert "未知" in _markup_health(False, "探测连接失败", False)
+    assert "异常" in _markup_health(False, "port closed", True)
+    # 旧状态文件没有这个字段：保持旧语义（宁可按异常提醒）。
+    assert "异常" in _markup_health(False, "port closed")
+    assert "健康" in _markup_health(True, None, True)
+    assert "未知" in _markup_health(None, None, None)
+
+
+def test_check_reports_an_unanswered_probe_as_unknown(monkeypatch) -> None:
+    """``ponte check`` 探不到时说“未知”，且不阻断其余 profile 的结果。"""
+    from ponte.core import ProbeError
+
+    class _Daemon:
+        profile_names = ["default", "offsite"]
+
+        def check_remote_ports(self, timeout=10, profile=None):
+            if profile == "default":
+                raise ProbeError("探测连接失败（ssh 退出码 255）：23334 的状态未知")
+            return {23335: True}
+
+        def check_local_ports(self, timeout=1.0, profile=None):
+            return {}
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["check"])
+
+    assert result.exit_code == 0
+    assert "未知" in result.output and "255" in result.output
+    assert "23335" in result.output
+    assert "未监听" not in result.output
+
+
 def test_status_table_shows_tunnel_stats(monkeypatch) -> None:
     """默认表格输出包含会话统计与上次断线原因（信息缺口修复）。"""
     s = _status(
@@ -205,6 +279,35 @@ def test_status_table_shows_tunnel_stats(monkeypatch) -> None:
     assert "会话 4 次" in result.output
     assert "重连 3 次" in result.output
     assert "ssh exited with code 255" in result.output
+
+
+def test_stop_survives_a_config_that_no_longer_validates(tmp_path) -> None:
+    """一个笔误不该锁死 stop：配置校验失败时仍按 [daemon] 路径定位守护进程。"""
+    pid = tmp_path / "ponte.pid"
+    # 肯定不存在的 pid：确保不会误杀测试进程（stop 必须在“未运行”分支返回）。
+    pid.write_text("999999999", encoding="utf-8")
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[daemon]\n"
+        f'pid_file = "{pid.as_posix()}"\n'
+        '\n[ssh]\nhost = "example.com"\n',  # 缺 [[tunnels]] → 严格加载必失败
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config", str(path), "stop"])
+
+    assert result.exit_code == 0
+    assert "未运行" in result.output
+
+
+def test_restart_still_refuses_a_broken_config(tmp_path) -> None:
+    """restart 必须校验成功再动手：否则坏配置会先把隧道停掉、再启动失败。"""
+    path = tmp_path / "config.toml"
+    path.write_text('[ssh]\nhost = "example.com"\n', encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["--config", str(path), "restart"])
+
+    assert result.exit_code == 1
 
 
 def test_watch_renders_dashboard(monkeypatch) -> None:
@@ -352,6 +455,90 @@ def test_restart(monkeypatch) -> None:
     assert result.exit_code == 0
     assert fake.stopped
     assert fake.started
+
+
+def _write_reload_config(tmp_path) -> str:
+    """A minimal, valid single-tunnel config, for ``ponte reload`` tests."""
+    key = tmp_path / "id_rsa"
+    key.write_text("x", encoding="utf-8")
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[ssh]\n"
+        'host = "example.com"\n'
+        'user = "u"\n'
+        f'identity_file = "{key.as_posix()}"\n'
+        "\n[[tunnels]]\n"
+        "remote_port = 23334\n"
+        'local_host = "localhost"\n'
+        "local_port = 2222\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_reload_command_requests_a_reload(monkeypatch, tmp_path) -> None:
+    """reload 只发出重载请求，不重启进程。"""
+    cfg = dataclasses.replace(_cfg(), source_path=_write_reload_config(tmp_path))
+
+    class _Daemon:
+        def __init__(self) -> None:
+            self.config = cfg
+            self.reloaded = False
+
+        def status(self) -> DaemonStatus:
+            return DaemonStatus(running=True, pid=1, uptime_seconds=1)
+
+        def request_reload(self) -> None:
+            self.reloaded = True
+
+    fake = _Daemon()
+    monkeypatch.setattr("ponte.main._daemon", lambda: fake)
+    result = CliRunner().invoke(app, ["reload"])
+    assert result.exit_code == 0
+    assert fake.reloaded is True
+    assert "已请求重载" in result.output
+
+
+def test_reload_command_refuses_a_broken_config(monkeypatch, tmp_path) -> None:
+    """写坏的配置必须在本地就被拦住，绝不能发给守护进程。"""
+    path = tmp_path / "config.toml"
+    path.write_text("not = toml = =", encoding="utf-8")
+    cfg = dataclasses.replace(_cfg(), source_path=str(path))
+
+    class _Daemon:
+        def __init__(self) -> None:
+            self.config = cfg
+
+        def status(self) -> DaemonStatus:  # pragma: no cover - must not be reached
+            raise AssertionError("坏配置不该走到读取状态这一步")
+
+        def request_reload(self) -> None:  # pragma: no cover
+            raise AssertionError("坏配置不得发出重载请求")
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["reload"])
+    assert result.exit_code == 1
+    assert "配置有问题" in result.output
+
+
+def test_reload_when_not_running(monkeypatch, tmp_path) -> None:
+    """守护进程没跑就别留下孤零零的标记文件。"""
+    cfg = dataclasses.replace(_cfg(), source_path=_write_reload_config(tmp_path))
+
+    class _Daemon:
+        def __init__(self) -> None:
+            self.config = cfg
+
+        def status(self) -> DaemonStatus:
+            return DaemonStatus(running=False)
+
+        def request_reload(self) -> None:  # pragma: no cover
+            raise AssertionError("未运行时不该写标记")
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["reload"])
+    assert result.exit_code == 0
+    assert "未运行" in result.output
 
 
 def test_test_command_ok(monkeypatch) -> None:
@@ -749,3 +936,131 @@ def test_status_json_includes_destination(monkeypatch) -> None:
     assert result.exit_code == 0
     payload = _json.loads(result.output)
     assert payload["profiles"]["default"]["destination"] == "testuser@example.com:22"
+
+
+def test_status_json_includes_the_jump_chain(monkeypatch) -> None:
+    """--json 里也要有跳板机：脚本得能区分“连不上服务器”与“连不上跳板机”。"""
+    import json as _json
+
+    s = _status(
+        ProfileStatus(
+            name="default",
+            destination="testuser@example.com:22",
+            jump="ops@bastion:2222",
+            healthy=True,
+        ),
+        running=True,
+        pid=7,
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    payload = _json.loads(result.output)
+    assert payload["profiles"]["default"]["jump"] == "ops@bastion:2222"
+
+
+def test_status_json_keeps_the_availability_precision(monkeypatch) -> None:
+    """在线率是 0..1 的比例，不能按秒数那样取整成 1.0。
+
+    0.9796 按“一位小数”舍入就是 1.0：一条半小时里断了 15 分钟的隧道会被
+    报成 100% 可用，而看板与 Prometheus 拿的都是这个值。
+    """
+    import json as _json
+
+    s = _status(
+        ProfileStatus(
+            name="default",
+            destination="testuser@example.com:22",
+            healthy=True,
+            tunnel_uptime_seconds=3600.0 * 12,
+            tunnel_downtime_seconds=900.0,
+        ),
+        running=True,
+        pid=7,
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    payload = _json.loads(result.output)
+    assert payload["profiles"]["default"]["availability"] == 0.98
+
+
+def test_config_ssh_command_prints_the_real_argv(monkeypatch) -> None:
+    """--ssh-command 要把 ponte 真正会执行的命令行原样吐出来。"""
+    monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    result = CliRunner().invoke(app, ["config", "--ssh-command"])
+    assert result.exit_code == 0
+    assert "/usr/bin/ssh" in result.output
+    assert "-R 23334:localhost:2222" in result.output
+    assert "testuser@example.com" in result.output
+
+
+def test_config_shows_the_jump_host(monkeypatch) -> None:
+    """跳板机要在 config 里看得见，--ssh-command 也要真的把 -J 拼进去。"""
+    cfg = _cfg()
+    profile = dataclasses.replace(
+        cfg.profiles[0],
+        ssh=dataclasses.replace(
+            cfg.profiles[0].ssh, jumps=(JumpHop(host="bastion", user="ops"),)
+        ),
+    )
+    monkeypatch.setattr(
+        "ponte.main.get_config", lambda: dataclasses.replace(cfg, profiles=[profile])
+    )
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+
+    result = CliRunner().invoke(app, ["config"])
+    assert result.exit_code == 0
+    assert "跳板机" in result.output
+    assert "ops@bastion" in result.output
+
+    argv = CliRunner().invoke(app, ["config", "--ssh-command"])
+    assert argv.exit_code == 0
+    assert "-J ops@bastion" in argv.output
+
+
+def test_doctor_json_reports_failures_and_exits_nonzero(monkeypatch) -> None:
+    """doctor --json 既给结构化报告，又保留能直接 if 判断的退出码。"""
+    import json as _json
+
+    # _cfg() 的 identity_file 指向一个不存在的路径 → 必然有 FAIL。
+    monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
+    monkeypatch.setattr("ponte.main._daemon", lambda: _FakeDaemon(running=False))
+    result = CliRunner().invoke(app, ["doctor", "--offline", "--json"])
+
+    payload = _json.loads(result.output)
+    assert set(payload) == {"ok", "counts", "checks"}
+    assert payload["ok"] is False
+    assert payload["counts"]["fail"] >= 1
+    assert result.exit_code == 1
+    first = payload["checks"][0]
+    assert set(first) == {"name", "status", "detail", "hint"}
+    assert payload["counts"]["fail"] == sum(
+        1 for check in payload["checks"] if check["status"] == "fail"
+    )
+
+
+def test_shell_completion_script_is_available(monkeypatch) -> None:
+    """add_completion=True：--show-completion 按指定的 shell 生成补全脚本。
+
+    必须先关掉 shell 自动探测。探测可用时 typer 会把 --show-completion 变成一个
+    不接受取值的开关，shell 改由父进程链探测决定——在 CI 里（macOS runner 的父
+    进程链里没有能识别的 shell）探测结果不在 typer 的脚本表里，命令直接以 1 退
+    出。关掉探测后取值才真正生效，各平台结果一致；这里要 zsh 而不是 bash，是为
+    了证明用的是参数而不是探测结果。
+    """
+    monkeypatch.setenv("_TYPER_COMPLETE_TEST_DISABLE_SHELL_DETECTION", "1")
+    result = CliRunner().invoke(app, ["--show-completion", "zsh"])
+    assert result.exit_code == 0
+    assert "#compdef" in result.output

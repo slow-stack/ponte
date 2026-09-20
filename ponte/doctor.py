@@ -4,9 +4,10 @@ Every check answers with a *conclusion* and — when something is off — a fix 
 act on. That is the difference between "it does not work" and a support thread.
 
 Doctor is strictly read-only: it never installs, restarts or changes anything,
-so it is always safe to run on a machine you are debugging. The one exception
-worth knowing about is the connectivity check, which opens a short-lived SSH
-connection exactly like ``ponte test``; ``--offline`` skips it.
+so it is always safe to run on a machine you are debugging. The exceptions worth
+knowing about are the connectivity check, which opens a short-lived SSH
+connection exactly like ``ponte test``, and the jump-host probe, which opens one
+TCP connection; ``--offline`` skips both.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from ponte.config import NotifyConfig, Profile, TunnelConfig
-from ponte.core import TunnelManager
+from ponte.core import ProbeError, TunnelManager, port_is_open
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids importing the world
     from ponte.daemon import DaemonStatus
@@ -188,6 +189,11 @@ def _profile_checks(
     ]
     if sys.platform != "win32":
         results.append(_key_permission_check(profile, label))
+    jump = _jump_check(profile, label, offline, timeout)
+    if jump is not None:
+        # Reported *before* connectivity on purpose: when the bastion is down
+        # the login failure that follows is a consequence, not a second problem.
+        results.append(jump)
 
     # Connectivity is worth testing even when nothing is running: it is the one
     # thing that tells apart "my config is wrong" from "the daemon is down".
@@ -227,8 +233,15 @@ def _ssh_client_check(
 def _identity_check(profile: Profile, label: Callable[[str], str]) -> CheckResult:
     path = profile.ssh.identity_file
     if not path:
+        # Not an error any more: without ``identity_file`` ponte omits ``-i``
+        # and lets ssh resolve the key from ~/.ssh/config, ssh-agent or its
+        # default locations. Only warn that this may not survive a rebooted
+        # service with no agent.
         return CheckResult(
-            label("密钥文件"), FAIL, "未配置 identity_file", "在配置里把 identity_file 指到私钥"
+            label("密钥文件"),
+            OK,
+            "未配置，交由 ~/.ssh/config / ssh-agent / 默认密钥",
+            "后台服务读不到 ssh-agent 时，建议显式设置 [ssh] identity_file",
         )
     if not os.path.isfile(path):
         return CheckResult(
@@ -243,6 +256,8 @@ def _identity_check(profile: Profile, label: Callable[[str], str]) -> CheckResul
 def _key_permission_check(profile: Profile, label: Callable[[str], str]) -> CheckResult:
     """POSIX only: a world/group readable private key is refused by OpenSSH."""
     path = profile.ssh.identity_file
+    if not path:
+        return CheckResult(label("密钥权限"), SKIP, "未显式配置 identity_file")
     try:
         mode = os.stat(path).st_mode
     except OSError as exc:
@@ -257,6 +272,59 @@ def _key_permission_check(profile: Profile, label: Callable[[str], str]) -> Chec
     return CheckResult(label("密钥权限"), OK, oct(mode & 0o777))
 
 
+def _jump_check(
+    profile: Profile,
+    label: Callable[[str], str],
+    offline: bool,
+    timeout: int,
+) -> CheckResult | None:
+    """Reachability of the first jump hop (``None`` without a jump chain).
+
+    A tunnel through a bastion fails in one of two places — the hop, or the
+    server behind it — and ssh reports both with the same unhelpful login
+    failure. A plain TCP connect to the hop tells the two apart in one line.
+
+    Only the *first* hop is probed: every later one is reached through its
+    predecessor, so a connect attempt from here would fail on a perfectly
+    healthy chain and turn the report into a lie.
+    """
+    hops = profile.ssh.jumps
+    if not hops:
+        return None
+    chain = " → ".join(hop.destination for hop in hops)
+    head = hops[0]
+    name = label("跳板机")
+    if offline:
+        return CheckResult(name, SKIP, f"{chain}（已跳过，--offline）")
+    if port_is_open(head.host, head.port, timeout):
+        detail = f"{chain}（第一跳 {head.host}:{head.port} 可达）"
+        if len(hops) > 1:
+            detail += "；后续跳只能经前一跳验证，以 SSH 连通性为准"
+        return CheckResult(name, OK, detail)
+    return CheckResult(
+        name,
+        FAIL,
+        f"连不上第一跳 {head.host}:{head.port}（完整链路：{chain}）",
+        f"先在终端单独执行 ssh {head.destination}，确认地址、端口、密钥与"
+        "authorized_keys；堡垒机不可达时，后面的隧道一定起不来",
+    )
+
+
+def _connectivity_hint(profile: Profile) -> str:
+    """Hint for a failed login, naming the bastion when there is one.
+
+    "Check that the server is reachable" is misleading advice when the server
+    is *supposed* to be unreachable from here — the thing to verify is the hop.
+    """
+    head = profile.ssh.first_hop
+    if head is None:
+        return _SSH_HINT
+    return (
+        f"链路是 {profile.ssh.proxy_jump}，本机只直连第一跳：先单独 ssh "
+        f"{head.destination} 验证跳板机，再用 ssh -J … 验证整条链路"
+    )
+
+
 def _connectivity_check(
     daemon: DoctorDaemon | None,
     profile: Profile,
@@ -269,13 +337,17 @@ def _connectivity_check(
         return CheckResult(name, SKIP, "已跳过（--offline）")
     if daemon is None:
         return CheckResult(name, SKIP, "没有可用的守护进程对象")
+    hint = _connectivity_hint(profile)
     try:
         reachable = daemon.test_connection(timeout=timeout, profile=profile.name)
     except Exception as exc:  # noqa: BLE001
-        return CheckResult(name, FAIL, f"{type(exc).__name__}: {exc}", _SSH_HINT)
+        return CheckResult(name, FAIL, f"{type(exc).__name__}: {exc}", hint)
     if reachable:
-        return CheckResult(name, OK, f"能在 {timeout}s 内登录 {profile.destination}")
-    return CheckResult(name, FAIL, f"{timeout}s 内未能登录 {profile.destination}", _SSH_HINT)
+        detail = f"能在 {timeout}s 内登录 {profile.destination}"
+        if profile.ssh.jumps:
+            detail += f"（经 {profile.ssh.proxy_jump}）"
+        return CheckResult(name, OK, detail)
+    return CheckResult(name, FAIL, f"{timeout}s 内未能登录 {profile.destination}", hint)
 
 
 def _remote_ports_check(
@@ -299,6 +371,10 @@ def _remote_ports_check(
         return CheckResult(name, SKIP, "守护进程未运行，端口状态没有参考价值")
     try:
         state = daemon.check_remote_ports(timeout=timeout, profile=profile.name)
+    except ProbeError as exc:
+        # The probe's own connection failed: this is "cannot tell", not "the
+        # ports are closed" — and it must not read as a failure to the user.
+        return CheckResult(name, WARN, str(exc))
     except Exception as exc:  # noqa: BLE001
         return CheckResult(name, WARN, f"探测失败：{type(exc).__name__}: {exc}")
     down = [port for port, is_open in sorted(state.items()) if not is_open]
@@ -354,7 +430,15 @@ def _daemon_check(status: DaemonStatus | None) -> CheckResult:
 
     profiles = list(status.profiles)
     detail = f"pid {status.pid if status.pid is not None else '?'}，已运行 {status.uptime}"
-    broken = [p.name for p in profiles if p.healthy is False]
+    # ``healthy is False`` alone is not a verdict: a check the daemon could not
+    # complete (``health_conclusive is False``) reports False too, and calling
+    # that "异常" here is the false alarm this check exists to avoid.
+    broken = [
+        p.name for p in profiles if p.healthy is False and p.health_conclusive is not False
+    ]
+    unverified = [
+        p.name for p in profiles if p.healthy is False and p.health_conclusive is False
+    ]
     unknown = [p.name for p in profiles if p.healthy is None]
     if broken:
         return CheckResult(
@@ -365,6 +449,13 @@ def _daemon_check(status: DaemonStatus | None) -> CheckResult:
         )
     if unknown:
         return CheckResult("守护进程", WARN, f"{detail}，尚未上报健康状态：{', '.join(unknown)}")
+    if unverified:
+        return CheckResult(
+            "守护进程",
+            WARN,
+            f"{detail}，无法判定（探测连接没建起来）：{', '.join(unverified)}",
+            "隧道本身可能在正常转发；ponte logs -n 50 看探测失败原因",
+        )
     return CheckResult("守护进程", OK, f"{detail}，{len(profiles)} 条隧道全部健康")
 
 

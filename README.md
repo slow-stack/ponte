@@ -40,6 +40,24 @@
   jitter (`max_retries=0` = retry forever), so a drop never becomes a dead
   tunnel. A session that stays up ≥ `stable_after` seconds resets the retry
   budget, so a long-running tunnel is never abandoned after a few flaky drops.
+- 🔄 **Hot reload** — `ponte reload` re-reads the config and restarts *only* the
+  profiles whose settings actually changed, so adding a tunnel (or fixing one
+  server) no longer drops every other connection. `kill -HUP` does the same on
+  POSIX. A config with a typo in it is rejected before the daemon sees it and the
+  running tunnels are left untouched.
+- 🔑 **Your `~/.ssh/config` still counts** — only `host` is required in `[ssh]`.
+  Leave out `user` and/or `identity_file` and ponte stops forcing `user@` and
+  `-i`, so OpenSSH resolves them itself: `Host` aliases, `User`, `IdentityFile`,
+  ssh-agent. A machine where `ssh myserver` already works needs no duplication,
+  and ponte no longer overrides an `IdentityFile` you set there.
+  `ponte config --ssh-command` prints the exact command line it will run.
+- 🧱 **Jump hosts are first-class** — `jump = "ops@bastion"` in `[ssh]` reaches a
+  server only the bastion can see. It is handed to `ssh -J` verbatim (comma
+  separated for a chain, `[user@]host[:port]` per hop), so OpenSSH builds the
+  hop itself and the bastion's user/key come from `~/.ssh/config` as well — no
+  second key path to keep in sync. `ponte doctor` probes the one hop that is
+  actually reachable from here and says "the bastion is unreachable" instead of
+  leaving you with a login failure, while `ponte test` validates the whole chain.
 - 🛟 **Crash recovery** — `install` registers an OS auto-start service:
   boot-or-logon Scheduled Task (Windows), systemd user unit (Linux), launchd agent (macOS).
 - 💚 **Health checks** — periodic local-process + remote-port probing, with
@@ -53,11 +71,17 @@
   session that stays up ≥ `stable_after` seconds. `ponte notify-test` proves the
   channel works *before* the outage. Off by default: nothing leaves your machine
   unless you enable it.
+- 💚 **Health checks that distinguish "broken" from "couldn't ask"** — each
+  tick probes the SSH process locally and the forwarding ports on the server.
+  A probe connection that fails is reported as *unknown* (yellow, with the
+  reason) rather than as a dead port, and never counts towards the
+  zombie-session reconnect.
 - 🩺 **`ponte doctor`** — one command that checks the config, the key file and
   its permissions, SSH reachability, listening ports, auto-start status and the
   notify channel, each row ending in a concrete fix instead of a black box.
 - 📊 **A dashboard and a metrics endpoint** — `ponte serve` puts the same status
-  on HTTP: `/` is a self-contained dashboard (no CDN, no JavaScript), `/healthz`
+  on HTTP: `/` is a self-contained dashboard (one file, no CDN, no external
+  assets, complete without JavaScript), `/healthz`
   answers `503` when a tunnel is actually broken, `/metrics` speaks Prometheus
   and `/status.json` is exactly `ponte status --json`. Loopback-only by default;
   exposing it needs an explicit token.
@@ -88,20 +112,23 @@ import package stay `ponte`; a checkout installs the same way (`pipx install .`)
 | `init [--path P] [--force]` | write a config file from the template (never overwrites without `--force`) |
 | `start` / `start --foreground` | start daemon in background / foreground (debug) |
 | `stop` / `restart` | graceful stop / stop-then-start |
+| `reload` | re-read the config and restart only the tunnels whose settings changed |
 | `status [--json]` | per-profile health, ports and tunnel statistics (`--json` for scripts) |
 | `watch [--interval S]` | live dashboard: per-profile health, session uptime, reconnects, event feed |
 | `logs [-n N] [--follow]` | view / tail the daemon log |
 | `test [--profile NAME]` | quick SSH connectivity check (every profile by default) |
 | `check [--profile NAME]` | verify tunnel ports are listening (`-R` on the server, `-L`/`-D` locally) |
-| `doctor [--offline] [--timeout S]` | one-shot checkup of config, key, connectivity, ports, auto-start and notifications, each row with a fix |
+| `doctor [--offline] [--timeout S] [--json]` | one-shot checkup of config, key, connectivity, ports, auto-start and notifications, each row with a fix (`--json` for scripts) |
 | `notify-test [--profile NAME]` | send a test alert through the configured ntfy / webhook channels |
 | `serve [--host H] [--port P] [--token T] [--open]` | local HTTP dashboard, `/healthz` probe, Prometheus `/metrics`, `/status.json` snapshot |
 | `install` / `uninstall` | register / remove the OS auto-start service |
-| `config` | print the effective configuration, its source file and any warnings |
+| `config [--ssh-command]` | print the effective configuration, its source file and any warnings (`--ssh-command` prints the exact `ssh` argv) |
 
 Global options (before the command): `--config/-c PATH` pin a config file,
 `--version/-V` print the version. Unknown/typo'd config keys are reported by
-`ponte config` instead of being silently ignored.
+`ponte config` instead of being silently ignored. Run
+`ponte --install-completion` once to add shell completion
+(bash / zsh / fish / PowerShell).
 
 ## 📊 Web dashboard & monitoring
 
@@ -115,7 +142,7 @@ ponte serve --open     # ...and open it in your browser
 
 | Endpoint | What it answers |
 |----------|-----------------|
-| `/` | the dashboard: per-tunnel health, session age, availability, port state, last disconnect with its reason, event feed |
+| `/` | the dashboard: one row per tunnel — verdict, destination and jump chain, forwarded ports as chips, session age, availability, last disconnect reason; click a row for the full statistics and the event feed. Light and dark, refreshed in place (expanded rows and scroll position survive), and a `<noscript>` reload if scripting is off |
 | `/healthz` | `200` while the tunnels work, `503` as soon as one is broken — the endpoint to point a monitor at |
 | `/metrics` | Prometheus text exposition: session age, cumulative up/down time, availability, reconnects, port-listening state |
 | `/status.json` | exactly the payload of `ponte status --json` |
@@ -125,6 +152,16 @@ monitor can alert; `/metrics` always answers `200` and reports state as numbers,
 because a scrape failure would hide *why* a tunnel went down — which is exactly
 what a graph exists to show. And `/healthz` reports `starting` (with `200`) until
 the first health check completes, so restarting the daemon does not page you.
+
+**"Unknown" is not "down".** The remote probe is an SSH connection of its own,
+and on a shared/NATed uplink it fails on its own often enough (roughly a third
+of ticks in our measurements). So a check that could not be *completed* is kept
+apart from a check that produced a verdict: `/healthz` answers `200 unverified`
+(not `503`), `ponte status` shows `未知` with the probe's reason instead of
+`异常`, the dashboard prints `未观测` for a port group the probe never reached
+instead of a red `未监听`, and `ponte_profiles_unknown` counts them. Only a conclusive failure — the SSH process gone, or a port a probe
+*did* reach and found closed — pages you or triggers the zombie-session
+reconnect.
 
 **Security.** The dashboard names your servers, users and forwarded ports — it
 is a map of your infrastructure, not a status line. So `ponte serve` binds
@@ -210,7 +247,20 @@ environment-variable expansion. Resolution order (first existing file wins):
 Sections:
 
 - `[ssh]` — `host` / `port` / `user` / `identity_file` / `known_hosts_file` /
-  `options` (any extra key there is passed through verbatim as `-o key=value`)
+  `jump` / `options` (any extra key there is passed through verbatim as
+  `-o key=value`).
+  Only `host` is required: leave out `user` and/or `identity_file` and ponte
+  stops forcing `user@` and `-i`, so OpenSSH resolves them from your
+  `~/.ssh/config` (`Host` alias, `User`, `IdentityFile`) or ssh-agent.
+  `ponte config --ssh-command` shows the resulting command line.
+- `[ssh] jump` — the bastion in front of `host`, in OpenSSH `ProxyJump` syntax:
+  `"bastion"`, `"ops@bastion"`, `"ops@bastion:2222"`, or a chain such as
+  `"ops@hop1, root@hop2"`. ponte passes it to `ssh -J` and never talks to the
+  hop itself, so the bastion's identity comes from its own `Host` block in
+  `~/.ssh/config` — there is deliberately no per-hop `identity_file` here.
+  `proxy_jump` is accepted as an alias (set only one). Combining `jump` with a
+  `ProxyJump`/`ProxyCommand` in `[ssh.options]` is rejected: those describe the
+  same hop and ssh would silently apply only one.
 - `[[profiles]]` — an alternative to the single-tunnel layout: each entry has
   `name`, its own `[profiles.ssh]` and its own `[[profiles.tunnels]]`. Mixed
   with a top-level `[ssh]`/`[[tunnels]]` it is rejected rather than guessed at;
@@ -247,11 +297,13 @@ Sections:
 |---------|---------------|
 | `Permission denied (publickey)` | public key on server `~/.ssh/authorized_keys`; on Windows strip inherited ACLs (`icacls id_rsa /inheritance:r /grant:r <user>:(R)`) |
 | Connection rejected after key change | delete `known_hosts`, reconnect (`StrictHostKeyChecking=accept-new` default) |
+| Server only reachable through a bastion | set `[ssh] jump = "ops@bastion"` — ponte hands it to `ssh -J`; `ponte doctor` then probes that hop and says whether the bastion itself is down |
 | Process alive but remote port down | cloud security-group inbound rules; check server with `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` — the daemon now force-reconnects a "zombie" tunnel after 3 consecutive failed checks |
 | Console window flashes at logon, or while stopping | the Scheduled Task must run `pythonw.exe` — check `[windows] pythonw_exe`; `ponte stop` also force-kills through a hidden `taskkill` |
 | `ponte serve` exits with "cannot bind" / port busy | another process holds the port — `ponte serve --port 8788`; the refused non-loopback bind is a *token* problem, and the message says so |
 | `/healthz` returns `401` | a `[serve].token` is set: pass `?token=...` or `Authorization: Bearer ...` |
 | `/healthz` returns `503` while the tunnel looks fine | it reports the *tunnel*, not the process: read `unhealthy` / `errors` in the body, then `ponte check` |
+| `/healthz` returns `200` with `"status": "unverified"` | the probe's own connection failed, so ponte cannot confirm the ports — read `unknown`, and check `ponte logs` if it persists |
 | Logs | `ponte logs -n 100 --follow` |
 
 ## 🧪 Development & testing
@@ -306,9 +358,25 @@ again. See [CONTRIBUTING.md](CONTRIBUTING.md).
 - 🔁 **自愈** — 无限重连 + 指数退避 + 全抖动（`max_retries=0` = 永远重试），
   掉线不会变成死隧道。会话稳定运行 ≥ `stable_after` 秒后重试预算归零，
   长跑隧道不会因前期几次抖动被永久放弃。
+- 🔄 **配置热重载** — `ponte reload` 重新读取配置，**只重启真的改过的那几条**
+  隧道：新增一条隧道、修好一台服务器，不再把其它正在跑的连接一起拆掉。
+  POSIX 下 `kill -HUP` 等价。配置写错时它会在守护进程看到之前就被拒绝，
+  正在跑的隧道不受影响。
+- 🔑 **复用你已有的 `~/.ssh/config`** — `[ssh]` 里 `host` 是唯一必填项。
+  省略 `user` 和/或 `identity_file` 后，ponte 不再强行拼出 `user@` 与 `-i`，
+  交给 OpenSSH 自己解析：`Host` 别名、`User`、`IdentityFile`、ssh-agent。
+  “`ssh myserver` 已经能用”的机器无需重复一份配置，ponte 也不会再覆盖你
+  写在 SSH 配置里的 `IdentityFile`。`ponte config --ssh-command` 打印最终命令。
+- 🧱 **跳板机是一等公民** — `[ssh]` 里写 `jump = "ops@bastion"` 就能连上只有堡垒机
+  看得到的服务器。它被原样交给 `ssh -J`（逐跳写 `[user@]host[:port]`，多跳用
+  逗号分隔），跳板机这一段由 OpenSSH 自己建立，它的用户与密钥同样来自
+  `~/.ssh/config`，不需要再维护第二份密钥路径。`ponte doctor` 只探测本机真正
+  能直连的那一跳，直接告诉你“堡垒机连不上”，而不是丢一个登录失败给你；
+  `ponte test` 则验证整条链路。
 - 🛟 **崩溃兜底** — `install` 注册系统级开机自启服务：Windows 计划任务（开机或登录） /
   Linux systemd user / macOS launchd。
-- 💚 **健康检查** — 周期探测本地进程存活 + 远程端口，异常给出明确诊断。
+- 💚 **健康检查** — 周期探测本地进程存活 + 远程端口，异常给出明确诊断；
+  “探针自己没连上”会被报成**未知**而不是异常，也不会据此强杀一条健康隧道。
   SSH 进程假死（活着但端口全掉）时连续 3 次检查失败即强制重连；检查失败
   指数退避，不会高频新开 SSH 触发服务器 `MaxStartups`。
 - 🔔 **真断了会主动告诉你** — 连续 `[notify].on_consecutive_failures` 次失败后，
@@ -317,8 +385,9 @@ again. See [CONTRIBUTING.md](CONTRIBUTING.md).
   让你在真出事**之前**就验证通道可用。默认关闭：不开启就绝不会外发任何数据。
 - 🩺 **`ponte doctor`** — 一条命令逐项体检：配置、密钥及其权限、SSH 连通性、
   监听端口、开机自启状态、通知通道，每行都给出具体修法而不是留个黑箱。
-- 📊 **看板与指标接口** — `ponte serve` 把同一份状态摆到 HTTP 上：`/` 是自包含的
-  看板（不依赖 CDN、不用 JavaScript），`/healthz` 在隧道真的断时回 `503`，
+- 📊 **看板与指标接口** — `ponte serve` 把同一份状态摆到 HTTP 上：`/` 是一个
+  自包含的看板（单文件、不依赖 CDN 与任何外部资源，关掉脚本也能完整渲染），
+  `/healthz` 在隧道真的断时回 `503`，
   `/metrics` 说 Prometheus 格式，`/status.json` 就是 `ponte status --json`。
   默认只监听本机；要对外必须先给令牌。
 - 🖥️ **跨平台** — 自动查找 `ssh`、按平台落盘运行时文件、可移植的远程端口探测
@@ -347,20 +416,22 @@ ponte install           # 注册开机自启 + 崩溃重启
 | `init [--path P] [--force]` | 从模板生成配置文件（不加 `--force` 不覆盖） |
 | `start` / `start --foreground` | 后台启动 / 前台启动（调试） |
 | `stop` / `restart` | 优雅停止 / 停旧起新 |
+| `reload` | 重读配置，只重启设置真的变了的隧道 |
 | `status [--json]` | 逐条隧道的健康、端口与统计（`--json` 供脚本消费） |
 | `watch [--interval S]` | 实时看板：每条隧道一栏，含会话时长、重连次数与事件流 |
 | `logs [-n N] [--follow]` | 查看 / 跟读日志 |
 | `test [--profile NAME]` | 快速测 SSH 连通性（默认逐条测试） |
 | `check [--profile NAME]` | 检查隧道端口（`-R` 在服务器上，`-L`/`-D` 在本机） |
-| `doctor [--offline] [--timeout S]` | 一键体检配置、密钥、连通性、端口、自启与通知，每项给出修法 |
+| `doctor [--offline] [--timeout S] [--json]` | 一键体检配置、密钥、连通性、端口、自启与通知，每项给出修法（`--json` 供脚本消费） |
 | `notify-test [--profile NAME]` | 通过已配置的 ntfy / webhook 通道发一条测试通知 |
 | `serve [--host H] [--port P] [--token T] [--open]` | 本地 HTTP 看板、`/healthz` 探活、Prometheus `/metrics`、`/status.json` 快照 |
 | `install` / `uninstall` | 注册 / 移除开机自启服务 |
-| `config` | 打印生效配置、来源文件与配置告警 |
+| `config [--ssh-command]` | 打印生效配置、来源文件与配置告警（`--ssh-command` 打印实际执行的 ssh 命令） |
 
 全局选项（写在子命令之前）：`--config/-c PATH` 指定配置文件，
 `--version/-V` 打印版本。拼错/未知的配置项会由 `ponte config` 报出来，
-不再被静默忽略。
+不再被静默忽略。运行一次 `ponte --install-completion` 即可启用 shell 补全
+（bash / zsh / fish / PowerShell）。
 
 ## 📊 网页看板与监控接入
 
@@ -374,7 +445,7 @@ ponte serve --open     # 顺手在浏览器里打开
 
 | 接口 | 回答什么问题 |
 |------|--------------|
-| `/` | 看板：逐条隧道的健康、当前会话时长、在线率、端口状态、上次断线原因与事件流 |
+| `/` | 看板：一行一条隧道——状态、目标与跳板机、端口 chips、会话时长、在线率、上次断线原因；点开该行看完整统计与事件流。跟随浅色/深色主题，原地刷新（展开的行与滚动位置都不会丢），关掉脚本则退化为整页刷新 |
 | `/healthz` | 隧道正常时 `200`，任一条断开立即 `503` —— 监控就探这个 |
 | `/metrics` | Prometheus 文本格式：会话时长、累计在线/离线、在线率、重连次数、端口监听状态 |
 | `/status.json` | 与 `ponte status --json` 完全一致的载荷 |
@@ -383,6 +454,14 @@ ponte serve --open     # 顺手在浏览器里打开
 报警；`/metrics` 永远回 `200`，把状态当数字报出来——因为采挂掉会盖住
 “它为何挂了”，而那正是画图的目的。另外首次健康检查完成前，`/healthz`
 报的是 `starting`（`200`），所以重启守护进程不会造成误报。
+
+**“未知”不是“挂了”。** 远程端口探测本身就是一条独立的 SSH 连接，在共享/NAT
+出口上它自己就会失败（我们实测约三分之一的检查如此）。所以 ponte 把“没问成”
+和“问了、答案是坏的”分开：`/healthz` 回 `200 unverified`（而不是 `503`），
+`ponte status` 显示黄色的 `未知` 并附上探测失败原因（而不是 `异常`），看板对探针
+没探到的那一组端口写明「未观测」而不是画成红色的「未监听」，
+`ponte_profiles_unknown` 单独计数。只有确凿的失败——SSH 进程没了，
+或探针**确实**连上并看到端口没在听——才会报警或触发假死强制重连。
 
 **安全模型。** 看板会列出你的服务器地址、登录用户与转发端口——这是一张
 内网拓扑图，不是一行状态。所以 `ponte serve` 只绑 `127.0.0.1`。绑到局域网或
@@ -468,7 +547,18 @@ ponte（本地守护进程，Python）
 各段含义：
 
 - `[ssh]` — `host` / `port` / `user` / `identity_file` / `known_hosts_file` /
-  `options`（该表内未列出的键会原样透传为 `-o key=value`）
+  `jump` / `options`（该表内未列出的键会原样透传为 `-o key=value`）。只有
+  `host` 必填：省略 `user` 和/或 `identity_file` 后，ponte 不再强行拼出
+  `user@` 与 `-i`，由 OpenSSH 从 `~/.ssh/config`（`Host` 别名、`User`、
+  `IdentityFile`）或 ssh-agent 解析。`ponte config --ssh-command` 可查看
+  最终命令行。
+- `[ssh] jump` — 目标服务器前面的跳板机，写法就是 OpenSSH 的 `ProxyJump`：
+  `"bastion"`、`"ops@bastion"`、`"ops@bastion:2222"`，或 `"ops@hop1, root@hop2"`
+  这样的多跳链路。ponte 把它交给 `ssh -J`，自己从不接触跳板机，所以跳板机的
+  身份来自它自己的 `Host` 块——这里**刻意不提供**第二份 `identity_file`。
+  `proxy_jump` 是等价的别名（只能写一个）。与 `[ssh.options]` 里的
+  `ProxyJump`/`ProxyCommand` 同时出现会被直接拒绝：它们说的是同一跳，
+  而 ssh 遇到重复设置只会静默采用其中一个。
 - `[[profiles]]` — 单隧道写法的替代品：每个条目有 `name`、自己的
   `[profiles.ssh]` 与 `[[profiles.tunnels]]`。与顶层 `[ssh]`/`[[tunnels]]`
   混用会被拒绝（而不是猜你的意图）；`retry`/`health`/`daemon`/`service`
@@ -503,11 +593,13 @@ ponte（本地守护进程，Python）
 |------|----------|
 | 「Permission denied (publickey)」 | 公钥是否加入服务器 `~/.ssh/authorized_keys`；Windows 下私钥去掉继承 ACL（`icacls id_rsa /inheritance:r /grant:r <用户名>:(R)`） |
 | 换 key 后连接被拒 | 删除 `known_hosts` 重连（默认 `StrictHostKeyChecking=accept-new`） |
+| 服务器只能经堡垒机访问 | 配 `[ssh] jump = "ops@bastion"`——ponte 原样交给 `ssh -J`；之后 `ponte doctor` 会探测那一跳，直接说明堡垒机自身是否可达 |
 | 进程活着但远程端口不通 | 云安全组入方向规则；服务器上 `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` 确认监听 —— 守护进程已支持假死检测：连续 3 次检查失败自动强制重连 |
 | 登录时（或 `stop` 时）闪出黑色控制台窗口 | 计划任务必须跑 `pythonw.exe`——检查 `[windows] pythonw_exe`；`ponte stop` 的强杀也已隐藏控制台 |
 | `ponte serve` 报绑定失败 / 端口占用 | 换端口：`ponte serve --port 8788`；若报的是非回环地址，那是**令牌**问题，报错里写了 |
 | `/healthz` 返回 `401` | 配了 `[serve].token`：带上 `?token=...` 或 `Authorization: Bearer ...` |
 | 隧道看着正常，`/healthz` 却回 `503` | 它报的是**隧道**不是进程：看响应体里的 `unhealthy` / `errors`，再用 `ponte check` 复核 |
+| `/healthz` 回 `200` 且 `"status": "unverified"` | 探测连接自己没建起来，ponte 无法确认端口状态：看 `unknown` 字段；持续如此就看 `ponte logs` |
 | 排查日志 | `ponte logs -n 100 --follow` |
 
 ## 🧪 开发与测试

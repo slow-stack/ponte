@@ -8,6 +8,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed health probe was reported as a dead port — and could kill a healthy
+  tunnel.** The server-side probe is an SSH connection of its own, and when that
+  connection failed (a reset, provider-side rate limiting, our own timeout kill)
+  every configured port was still reported as *not listening*. Two things
+  followed: `ponte status` showed `未监听`, and `_on_health` counted the tick
+  towards its three-consecutive-failures threshold, so the monitor force-killed
+  a session that was forwarding traffic perfectly well and made the retry loop
+  reconnect it — the flakier the path, the more often. Measured on a shared
+  uplink, roughly a third of probe ticks failed that way. "The probe never got
+  to ask" is now kept apart from "the probe asked and the answer was no":
+  `TunnelManager.check_remote_ports()` raises `ProbeError`, and the health
+  snapshot marks the result inconclusive (`HealthStatus.conclusive`) with the
+  reason instead of inventing port states. An inconclusive tick is not counted
+  towards the forced-reconnect threshold (the counter is left untouched, so a
+  real zombie is still caught across interleaved probe failures), `ponte status`
+  and the dashboard show `未知` with the probe's reason, `ponte doctor` warns
+  instead of failing, `ponte check` says `未知` for the affected profile without
+  hiding the others, and `/healthz` answers `200 unverified` with an `unknown`
+  list (a new `ponte_profiles_unknown` metric) rather than `503 degraded`.
+  `healthy: false` with `health_conclusive: false` in `status --json` is the
+  machine-readable form of that distinction.
+- **The health monitor could freeze forever on Windows — which disabled the one
+  recovery that saves a dead tunnel.** The SSH child was spawned with
+  `close_fds=False` (Windows has no close-on-exec, so this was meant to keep
+  `CREATE_NO_WINDOW` working), which handed that long-lived process a copy of
+  every inheritable handle — including the stdout pipe of the *following* health
+  probe. When the probe hit its timeout, `subprocess.run` killed it and then
+  blocked in `communicate()` waiting for a pipe whose write end the live SSH
+  session still held open, so the health thread never came back: `ponte status`
+  sat on its last reading ("异常") for hours while the tunnel was fine, and the
+  zombie-session force-reconnect — which runs off health ticks — never fired at
+  all. The SSH child now closes descriptors as on POSIX, and probes read through
+  a helper that bounds the wait twice and reports a wedged probe as failed
+  rather than hanging its caller.
+- **A broken config could leave you unable to stop the daemon.** `ponte stop`,
+  `status`, `logs` and `watch` all built their daemon handle from the validated
+  config, so one typo in a tunnel rule made every one of them fail with a
+  config error — including `stop`, which is exactly the command you need when
+  something is wrong. They now fall back to a minimal handle carrying only the
+  `[daemon]` pid/log paths, recovered from the raw TOML when the file still
+  parses and from the platform defaults when it does not; the fallback is
+  announced on stderr, so `status --json` still emits clean JSON. `start`,
+  `restart` and `install` keep requiring a valid config on purpose — and
+  `restart` validates *before* stopping anything, so a bad edit can no longer
+  leave a tunnel stopped and unrestartable.
 - **A console window could still flash on the stop path.** Every external
   control tool (`taskkill`, `systemctl`, `launchctl`) now goes through a single
   helper that applies `creation_flags()`. `taskkill` was the Windows offender:
@@ -17,9 +62,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pythonw.exe` sat next to `sys.executable`, the Scheduled Task quietly pointed
   at `python.exe` and a console window appeared at every logon. Installation now
   refuses with an actionable message instead of installing a task that pops up.
+- **A flapping tunnel was reported as 100% available.** `status --json` rounded
+  `availability` to one decimal *as a 0..1 ratio*, so 97.9% became `1.0` — and
+  that field is what the dashboard, `/status.json` and the Prometheus
+  `ponte_profile_availability_ratio` gauge all read, while `ponte status` printed
+  the truthful number from the unrounded value. The ratio is now rounded to
+  three decimals, which keeps the tenth of a percent those surfaces display.
 
 ### Changed
 
+- **Every SSH path now builds its connection flags in one place.** The tunnel,
+  the login test behind `ponte test` / the health loop / `doctor`, and the
+  server-side port probe each assembled their own `-o`/`-i`/`-p` list, so a
+  setting could reach the tunnel but not the checks that supervise it — a
+  mismatch that would have reported a perfectly healthy tunnel as dead. They now
+  share one builder, which is what makes adding `-J` safe.
+- **`[ssh]` may now defer to `~/.ssh/config`.** `user` and `identity_file` are
+  optional; only `host` is required. When either is omitted ponte no longer
+  forces `user@` / `-i` onto the command line, so OpenSSH resolves the user and
+  the key itself — from a `Host` alias, `User`, `IdentityFile` or an ssh-agent
+  identity. A machine whose plain `ssh myserver` already works no longer has to
+  duplicate that into ponte's config, and ponte stops overriding an
+  `IdentityFile` set in the SSH config. An explicitly configured
+  `identity_file` must still exist (unchanged), so a typo cannot silently fall
+  back to a different key.
 - **`ponte status --json` is now keyed by profile.** That contract was added in
   this same unreleased cycle, so nothing released depends on it: instead of one
   flat object of tunnel statistics the payload is
@@ -43,10 +109,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   taken from the config rather than the status file), shown as the first row of
   a `ponte status` table and included in `ponte status --json`. A table of
   numbers is useless if you cannot tell which server the broken one is; the
-  dashboard labels every card with it.
+  dashboard labels every row with it.
+- **The dashboard is one row per tunnel, not one card per tunnel.** Three
+  tunnels already needed a scroll, and the first requirement of a status page is
+  "see everything at once". Each row now carries the name and verdict, the
+  destination, the jump chain, the forwarded ports as chips, and one line of
+  session/availability/disconnect facts; the statistics table and the event feed
+  moved into the row's own `<details>` disclosure, so nothing was dropped — it is
+  only deferred. Port chips carry a glyph and a side label (`远程`/`本地`) rather
+  than relying on colour, and a row that is *unknown* shows `未观测` for the group
+  the probe never reached instead of a red `未监听`. The pill, the row's colour
+  bar and the header count all read one verdict helper, so they cannot disagree
+  about which tunnels are in trouble. The header also became a count of what is
+  actually wrong (a `0` tile is not rendered at all), and the page stopped being
+  dark-only: it now ships the light palette it had always advertised with
+  `<meta name="color-scheme" content="dark light">`, draws availability as a
+  small bar next to its digits, and uses tabular numerals so a number changing
+  under a refresh does not reflow the row it is in. (While building it: the
+  disclosure caret was written as a CSS `\25be` escape inside an ordinary Python
+  string, where Python reads `\25` as an *octal* escape — the caret rendered as a
+  control character.)
+- **The dashboard refreshes in place instead of reloading itself under you.**
+  The auto-refresh was a `<meta http-equiv="refresh">`, so every tick threw away
+  the page you were reading: an expanded row snapped shut, the scroll position
+  reset, and clicking a row could be undone before you finished reading it (on a
+  slow link it was worse than manual refreshing). The page is still rendered
+  complete on the server and still runs no script by default — the meta refresh
+  now lives inside `<noscript>`, so scripting off keeps exactly the old
+  behaviour, and a scripting browser never even creates that element. When a
+  script *is* running it fetches the same HTML and swaps the summary and the
+  board in place: expanded rows stay expanded (matched by profile name), the
+  scroll position does not move, and a row whose verdict changed since the
+  previous tick flashes, because a tunnel that dies between two refreshes should
+  be noticed rather than read as "it was always like that". It re-uses the
+  server's own rendering on purpose — a second renderer written in JavaScript is
+  exactly how a dashboard starts disagreeing with `ponte status`. The footer now
+  says which state it is in (`已更新 12:34:56 · 每 5 秒`, `已暂停`, or
+  `连接中断（第 N 次），仍在重试` instead of quietly showing a stale reading), a
+  `暂停` button stops polling while you read, polling stops by itself while the
+  tab is hidden, and a `401` says so instead of retrying forever.
 
 ### Added
 
+- **The jump chain is part of the status, next to the destination.**
+  `ProfileStatus.jump` carries the `ssh -J` value, so `ponte status --json` and
+  the dashboard can tell "cannot reach the server" apart from "cannot reach the
+  bastion" — the two failures ssh reports with the same message. The dashboard
+  prints `↳ 经 ops@bastion:2222` in amber on the row itself, because a bastion is
+  the link that fails first and the one nothing else in the config names.
+- **Jump hosts are a first-class setting: `[ssh] jump`.** "The server is only
+  reachable through the bastion" is the most common real topology this kind of
+  tool is pointed at, and it used to be unsupported in any discoverable way:
+  hand-writing `ProxyJump` into `[ssh.options]` worked, but nothing validated
+  it, `ponte config` did not show it, and `ponte doctor` could not tell "the
+  bastion is down" from "your key is wrong". The value keeps OpenSSH's own
+  `ProxyJump` syntax — `[user@]host[:port]`, comma separated for a chain — and
+  is passed to `ssh -J` verbatim, so there is nothing new to learn and the hop's
+  identity comes from `~/.ssh/config` just like the destination's (no second
+  `identity_file` to keep in sync). `proxy_jump` is accepted as an alias, hops
+  are validated at load time (bad port, empty hop, stray whitespace), and a
+  `jump` combined with a `ProxyJump`/`ProxyCommand` in `[ssh.options]` is
+  rejected — those describe the same hop, and ssh would silently apply only one.
+  `ponte config` shows the chain, `ponte config --ssh-command` shows the `-J`
+  it produces, and `ponte doctor` gained a jump-host row that TCP-probes the *first*
+  hop (the only one reachable from here — probing later hops would fail on a
+  healthy chain) before reporting connectivity, so a dead bastion is named as
+  the cause rather than surfacing as a login failure. When a jump is configured,
+  the connectivity hint tells you to test `ssh <first hop>` instead of sending
+  you to `authorized_keys` on a server you cannot reach anyway.
+- **`ponte reload` — apply a new config without dropping healthy tunnels.**
+  Re-reads the config file and restarts *only* the profiles whose settings
+  actually changed: a new profile is started, a removed one is stopped (and its
+  stale status section dropped), an unchanged one is left running. Because
+  `[retry]`/`[health]` are baked into a runner at construction time, a change to
+  either rebuilds every profile — but a pure tunnel edit no longer costs the
+  other connections. The request travels through a reload marker file (the same
+  cross-process mechanism as the stop marker), so it works on Windows too, with
+  `kill -HUP` as the POSIX equivalent. A config that fails to parse is rejected
+  *before* the daemon sees it — `ponte reload` validates it locally and reports
+  the error, and the running tunnels keep going.
+- **`ponte doctor --json`.** The same checkup as the table, as a stable JSON
+  object (`ok`, `counts`, `checks`), with the exit code still non-zero when
+  anything failed — so CI can store the report and gate on it in the same run.
+- **`ponte config --ssh-command`.** Prints the exact `ssh` argv ponte will
+  execute, one shell-quoted line per profile — the fastest way to answer "what
+  is it actually running?", especially now that `user`/`identity_file` may be
+  left to OpenSSH.
+- **Shell completion.** `ponte --install-completion` now installs completion
+  for bash / zsh / fish / PowerShell (`add_completion` was off before).
 - **Multiple SSH endpoints in one config: `[[profiles]]`.** A profile is a
   named SSH endpoint with its own key and its own `[[profiles.tunnels]]`, and a
   single daemon supervises every one of them concurrently — each with its own

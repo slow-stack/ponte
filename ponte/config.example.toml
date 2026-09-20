@@ -16,12 +16,28 @@
 # 所有路径支持 ~ 与环境变量展开。
 
 [ssh]
+# host 是唯一必填项。user / identity_file / port 留空（或删掉）时，ponte
+# 不再强行拼出 user@ 与 -i，而是交给 OpenSSH 自己解析——也就是你 ~/.ssh/config
+# 里的 Host 别名、User、IdentityFile、Port，或者 ssh-agent 里的身份。
+# 所以“ssh myserver 已经能用”的机器，这里只写 host = "myserver" 就够了。
 host = "YOUR_SERVER_IP"
 port = 22
 user = "YOUR_SSH_USER"
-# 按各平台 SSH 惯例放密钥即可（~ 自动展开）；如需自定义路径请直接改这里
+# 按各平台 SSH 惯例放密钥即可（~ 自动展开）；如需自定义路径请直接改这里。
+# 若 ~/.ssh/config 已配置 IdentityFile，删掉这一行即可复用，不必重复一遍。
 identity_file = "~/.ssh/id_rsa"
 known_hosts_file = "~/.ssh/known_hosts"
+
+# 跳板机 / 堡垒机：服务器只能从跳板机那侧（内网）访问时填写。
+# 写法就是 ssh 命令行的 ProxyJump，ponte 原样交给 ssh -J，不自己转发：
+#   jump = "bastion.example.com"              只用主机名
+#   jump = "ops@bastion.example.com"          指定跳板机上的登录用户
+#   jump = "ops@bastion.example.com:2222"     跳板机 SSH 不是 22 端口
+#   jump = "ops@hop1, ops@hop2"               多跳（逗号分隔），挨个排下去
+# jump = "ops@bastion.example.com"
+# 跳板机自己的密钥与用户同样交给 ~/.ssh/config（给堡垒机写一个 Host 块即可），
+# 所以这里不需要也不提供第二份 identity_file。列了 jump 就别再在 [ssh.options]
+# 里写 ProxyJump / ProxyCommand，两者会被拒绝（它们说的是同一件事）。
 
 [ssh.options]
 StrictHostKeyChecking = "accept-new"
@@ -84,6 +100,7 @@ description = "示例：把远端 23334 转发到本地 2222"
 #   host = "YOUR_SERVER_IP"
 #   user = "YOUR_SSH_USER"
 #   identity_file = "~/.ssh/id_rsa"
+#   jump = "ops@bastion.example.com"   # 可选，每条 profile 各自的跳板机
 #   [[profiles.tunnels]]
 #   remote_port = 8080
 #   local_host = "127.0.0.1"

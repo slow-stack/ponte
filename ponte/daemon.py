@@ -34,9 +34,18 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from typing import Any, cast
 from xml.sax.saxutils import escape as xml_escape
 
-from ponte.config import DEFAULT_PROFILE_NAME, Profile, TunnelConfig, get_config
+from ponte.config import (
+    DEFAULT_PROFILE_NAME,
+    ConfigError,
+    Profile,
+    TunnelConfig,
+    get_config,
+    load_config,
+    package_dir,
+)
 from ponte.core import TunnelManager, creation_flags
 from ponte.health import HealthChecker, HealthStatus
 from ponte.notify import Notification, Notifier
@@ -69,6 +78,8 @@ _PROFILE_KEYS = frozenset(
     {
         "process_alive",
         "healthy",
+        "health_conclusive",
+        "probe_error",
         "remote_ports",
         "local_ports",
         "health_error",
@@ -127,6 +138,37 @@ def _derive_stop_marker(pid_file: str) -> str:
     return base + ".stop"
 
 
+def _derive_reload_marker(pid_file: str) -> str:
+    """Derive the config-reload marker path from a ``.pid`` file path."""
+    base, _ext = os.path.splitext(pid_file)
+    return base + ".reload"
+
+
+def _is_package_dir(path: str) -> bool:
+    """Return ``True`` when *path* is the installed ``ponte`` package itself."""
+    return os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+        os.path.abspath(package_dir())
+    )
+
+
+def _spawn_log_path(pid_file: str) -> str:
+    """Where a background spawn's first output is captured."""
+    return f"{pid_file}.spawn.log"
+
+
+def _spawn_tail(path: str, limit: int = 600) -> str:
+    """Tail of a spawn log for an error message (empty when there is nothing)."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return ""
+    text = _decode_console(data).strip()
+    if not text:
+        return ""
+    return f"\n---- child output ({path}) ----\n" + text[-limit:]
+
+
 def _encode_ps(script: str) -> str:
     """Base64 UTF-16LE encode a PowerShell snippet for ``-EncodedCommand``.
 
@@ -150,6 +192,124 @@ def _decode_console(data: bytes) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return data.decode("gbk", errors="replace")
+
+
+def _windows_kernel32() -> Any:
+    """Return the ``kernel32`` handle used by the Windows process probes.
+
+    typeshed declares ``ctypes.windll`` for Windows only, so accessing it
+    directly makes ``mypy`` fail with ``attr-defined`` on Linux — which is where
+    CI runs the type check. The cast states the actual situation: the attribute
+    is always there at runtime, but only the Windows stubs know about it. Both
+    callers are Windows-only, so this never runs where ``windll`` is missing.
+    """
+    import ctypes
+
+    return cast(Any, ctypes).windll.kernel32
+
+
+def _windows_exit_code(pid: int) -> int | None:
+    """Return *pid*'s exit code, or ``None`` when the handle cannot be opened.
+
+    ``None`` means *unknown* — typically ACCESS_DENIED for a process owned by
+    another account — and not "dead"; :func:`_windows_pid_alive` decides what to
+    do about that. Split out into its own function so the liveness logic is
+    testable on any platform: ``ctypes.windll`` only exists on Windows.
+    """
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = _windows_kernel32()
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return None
+        return int(code.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_process_listed(pid: int) -> bool | None:
+    """Return whether *pid* is in the process list, or ``None`` if unknown.
+
+    A Toolhelp32 snapshot rather than ``tasklist`` on purpose: this runs on the
+    ``status`` / ``stop`` path, and spawning a console program there is exactly
+    how a harmless status check ends up flashing a black window. Enumeration
+    needs no rights at all, which is the point — it works for a process owned by
+    another account, where ``OpenProcess`` is refused outright.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    kernel32 = _windows_kernel32()
+    # Without these, a 64-bit snapshot handle is truncated to 32 bits on return.
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32First.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        found = bool(kernel32.Process32First(snapshot, ctypes.byref(entry)))
+        while found:
+            if int(entry.th32ProcessID) == int(pid):
+                return True
+            found = bool(kernel32.Process32Next(snapshot, ctypes.byref(entry)))
+        return False
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Windows liveness check that survives being run by a lesser account.
+
+    ``OpenProcess`` is the accurate answer — its exit code also proves the pid
+    was not recycled — but a standard user cannot open a process owned by
+    another account, and that is precisely the setup ponte recommends on
+    Windows: the daemon runs as SYSTEM so the tunnel exists before anyone logs
+    in, while ``status`` / ``stop`` are typed by the logged-in user. There
+    ``OpenProcess`` fails with ACCESS_DENIED, and calling a healthy daemon "not
+    running" is a lie with consequences: ``ponte start`` would launch a second
+    daemon that fights for the same server-side ports, and ``ponte stop`` would
+    refuse to stop the real one.
+
+    So an unopenable pid falls back to the process list, which needs no rights.
+    That cannot distinguish a recycled pid from the original — hence the
+    fallback, not the primary check.
+    """
+    code = _windows_exit_code(pid)
+    if code is not None:
+        return code == _STILL_ACTIVE
+    listed = _windows_process_listed(pid)
+    if listed is None:
+        # No answer at all: assume alive. Failing this way only costs a refused
+        # ``start``; failing the other way starts a duplicate daemon.
+        return True
+    return listed
 
 
 def _run_tool(
@@ -190,6 +350,12 @@ class ProfileStatus:
     #: ``status --json`` / dashboard row self-describing: a table of numbers is
     #: useless if you cannot tell which server is the broken one.
     destination: str | None = None
+    #: The jump chain (``ssh -J`` value, e.g. ``ops@bastion:2222``) this profile
+    #: reaches :attr:`destination` through, taken from the configuration like
+    #: :attr:`destination` is. Kept next to it because a tunnel that only exists
+    #: behind a bastion fails for a reason the destination alone cannot name:
+    #: ``ssh`` reports a dead hop and a refused login with the same message.
+    jump: str | None = None
     #: ``None`` until the first health check of this profile reports in.
     healthy: bool | None = None
     process_alive: bool | None = None
@@ -198,6 +364,12 @@ class ProfileStatus:
     local_ports: dict[int, bool] = dataclasses.field(default_factory=dict)
     """``-L``/``-D`` ports this machine listens on, ``{port: listening}``."""
     health_error: str | None = None
+    #: ``False`` when the last check could not be completed (the probe
+    #: connection failed), so ``healthy is False`` is *not* a verdict about the
+    #: tunnel. ``None`` for a status file written before this field existed.
+    health_conclusive: bool | None = None
+    #: The failed probe's message, when the remote ports could not be observed.
+    probe_error: str | None = None
     #: Set when this profile's retry loop died of an unexpected exception.
     error: str | None = None
 
@@ -295,7 +467,11 @@ class DaemonStatus:
 
 
 def _profile_status(
-    name: str, section: dict, *, destination: str | None = None
+    name: str,
+    section: dict,
+    *,
+    destination: str | None = None,
+    jump: str | None = None,
 ) -> ProfileStatus:
     """Build a :class:`ProfileStatus` from one status-file section.
 
@@ -330,14 +506,18 @@ def _profile_status(
 
     raw_healthy = section.get("healthy")
     raw_alive = section.get("process_alive")
+    raw_conclusive = section.get("health_conclusive")
     return ProfileStatus(
         name=name,
         destination=destination,
+        jump=jump,
         healthy=raw_healthy if isinstance(raw_healthy, bool) else None,
         process_alive=raw_alive if isinstance(raw_alive, bool) else None,
         remote_ports=_ports("remote_ports"),
         local_ports=_ports("local_ports"),
         health_error=section.get("health_error"),
+        health_conclusive=raw_conclusive if isinstance(raw_conclusive, bool) else None,
+        probe_error=section.get("probe_error"),
         error=section.get("error"),
         connect_attempts_total=_count("connect_attempts_total"),
         sessions_total=_count("sessions_total"),
@@ -442,6 +622,27 @@ class _StatusStore:
                     section.setdefault(key, 0.0)
                 section.setdefault("recent_events", [])
             self._write({"started_at": started_at, "profiles": sections})
+
+    def remove(self, names: list[str]) -> None:
+        """Drop the sections of *names* — profiles that left the config.
+
+        Used by a reload: the daemon no longer supervises them, so leaving
+        their stale health behind would make ``ponte status`` show a tunnel
+        that does not exist any more.
+        """
+        if not names:
+            return
+        with self._lock:
+            data = self._read()
+            sections = self._sections(data)
+            for name in names:
+                sections.pop(name, None)
+            self._write(
+                {
+                    "started_at": data.get("started_at", time.time()),
+                    "profiles": sections,
+                }
+            )
 
     @contextlib.contextmanager
     def edit(self, name: str) -> Iterator[dict]:
@@ -634,8 +835,14 @@ class TunnelDaemon:
         self.log_file = self.config.daemon.log_file
         self.status_file = _derive_status_file(self.pid_file)
         self.stop_marker = _derive_stop_marker(self.pid_file)
+        self.reload_marker = _derive_reload_marker(self.pid_file)
         self._store = _StatusStore(self.status_file)
         self._shutdown = threading.Event()
+        #: Serializes config reloads; also the "one reload at a time" guard.
+        self._reload_lock = threading.Lock()
+        #: Set while ``_reconcile`` swaps runners, so the supervisor does not
+        #: mistake the swap for "every profile died" and shut the daemon down.
+        self._reconciling = threading.Event()
         #: Shared by every profile: the channels and the rate limit are policy,
         #: not per-connection state.
         self.notifier = Notifier(self.config.notify)
@@ -661,12 +868,25 @@ class TunnelDaemon:
         user's home. It used to be the package's *parent* directory, which is
         wrong once the package is installed: ``site-packages`` is not a
         meaningful working directory and may not even be writable.
+
+        One case has to stay the parent, though: when the config file *is* the
+        one inside the package (the pre-0.3 layout, still supported). The daemon
+        and the generated service are started as ``python -m ponte.main``, and
+        from inside the package that import cannot resolve — Python finds the
+        package's parent on ``sys.path``, not the package itself. The child died
+        instantly, so ``ponte start`` reported only "daemon did not write its
+        PID file within 10 s" and ``ponte install`` would register a task that
+        can never start.
         """
         source = self.config.source_path
         if source:
             directory = os.path.dirname(os.path.abspath(source))
             if os.path.isdir(directory):
-                return directory
+                if not _is_package_dir(directory):
+                    return directory
+                # Legacy in-package config: the package's parent is where
+                # ``python -m ponte.main`` resolves from, and it is writable.
+                return os.path.dirname(os.path.abspath(package_dir()))
         return os.path.expanduser("~")
 
     # -- PID helpers -----------------------------------------------------------
@@ -687,22 +907,7 @@ class TunnelDaemon:
     def _pid_alive(pid: int) -> bool:
         """Return ``True`` if *pid* names a live process on this OS."""
         if sys.platform == "win32":
-            import ctypes
-
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
-            )
-            if not handle:
-                return False
-            try:
-                code = ctypes.c_ulong()
-                ok = ctypes.windll.kernel32.GetExitCodeProcess(
-                    handle, ctypes.byref(code)
-                )
-                return bool(ok and code.value == _STILL_ACTIVE)
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
+            return _windows_pid_alive(pid)
         # POSIX: signal 0 just probes for existence.
         try:
             os.kill(pid, 0)
@@ -736,6 +941,14 @@ class TunnelDaemon:
         loop's blocking ``connect()`` return so the tunnel is re-established
         instead of being left down forever.
 
+        Only *conclusive* unhealthy checks count towards that threshold. A
+        check that could not be completed (``status.conclusive`` is False — the
+        probe connection itself failed, so nothing was learned about the ports)
+        is neither a failure nor a recovery: it leaves the counter untouched and
+        can never trigger a forced reconnect. Otherwise a path that drops
+        probe connections — a shared uplink, provider rate limiting — would
+        let the monitor kill a healthy tunnel.
+
         ``manager`` may be ``None`` (e.g. in unit tests, or before ``run()``),
         in which case the forced-reconnect path is skipped — the health data is
         still persisted and logged as usual.
@@ -747,6 +960,8 @@ class TunnelDaemon:
                     "checked_at": time.time(),
                     "process_alive": status.process_alive,
                     "healthy": status.all_healthy,
+                    "health_conclusive": status.conclusive,
+                    "probe_error": status.remote_probe_error,
                     "remote_ports": {
                         str(p): ok for p, ok in status.remote_ports.items()
                     },
@@ -764,8 +979,24 @@ class TunnelDaemon:
             self._health_failures[profile] = 0
             return
 
-        # Unhealthy check: count it, and if the SSH process is still alive
-        # (i.e. a zombie rather than a cleanly-exited process) force reconnect.
+        # Inconclusive check: the tunnel's state is unknown, so this is not
+        # evidence of a zombie — and killing the session on it would be a
+        # self-inflicted outage. Note the counter is deliberately *left alone*
+        # rather than reset, so a real zombie is still caught after
+        # _HEALTH_FAILURE_THRESHOLD conclusive failures even when inconclusive
+        # checks are interleaved.
+        if not status.conclusive:
+            logger.warning(
+                "health[%s]: 状态未知 — 本次检查没有得出结论（%s），"
+                "不计入强制重连",
+                profile,
+                status.remote_probe_error or status.error or "原因未知",
+            )
+            return
+
+        # Conclusive unhealthy check: count it, and if the SSH process is still
+        # alive (i.e. a zombie rather than a cleanly-exited process) force
+        # reconnect.
         failures = self._health_failures.get(profile, 0) + 1
         self._health_failures[profile] = failures
         if (
@@ -886,6 +1117,9 @@ class TunnelDaemon:
         """
         self._setup_logging()
         log = logging.getLogger("ponte.daemon")
+        # The spawn log exists only to explain a startup that never got this
+        # far; now that logging works it would sit next to the pid file forever.
+        self._safe_remove(_spawn_log_path(self.pid_file))
 
         import ponte
         log.info(
@@ -896,6 +1130,9 @@ class TunnelDaemon:
         )
         self.write_pid()
         self._safe_remove(self.stop_marker)
+        # A reload request left behind by a previous, already-dead daemon must
+        # not fire on this one's first sweep.
+        self._safe_remove(self.reload_marker)
 
         # Prime the status file with a start time before the first health tick.
         # Merge, don't overwrite: the cumulative tunnel statistics must survive
@@ -907,7 +1144,6 @@ class TunnelDaemon:
             ProfileRunner(profile, self.config, self)
             for profile in self.config.profiles
         ]
-        runners = self._runners
 
         def request_stop(reason: str) -> None:
             """Request shutdown from any thread. Idempotent, never raises."""
@@ -915,8 +1151,18 @@ class TunnelDaemon:
                 return
             log.info("shutdown requested: %s", reason)
             self._shutdown.set()
-            for runner in runners:
+            for runner in self._runners:
                 runner.abort()
+
+        def request_reload() -> None:
+            """Apply a new config on a worker thread, leaving the caller free.
+
+            Reconciling can block while it joins a retired profile's thread, so
+            it must not run on the marker watcher (which also has to notice a
+            stop request)."""
+            threading.Thread(
+                target=self._reload_worker, name="ponte-reload", daemon=True
+            ).start()
 
         # SIGINT (Ctrl+C) and, where catchable, SIGTERM.
         try:
@@ -925,6 +1171,15 @@ class TunnelDaemon:
         except (ValueError, OSError):
             pass  # SIGTERM may be uncatchable on some Windows builds
 
+        # SIGHUP is the POSIX convention for "re-read your config"; the marker
+        # file covers every platform, including Windows where SIGHUP is not
+        # deliverable.
+        if sys.platform != "win32":
+            try:
+                signal.signal(signal.SIGHUP, lambda *_a: request_reload())
+            except (ValueError, OSError, AttributeError):
+                pass
+
         # Stop-marker watcher gives cross-process graceful stop on Windows.
         threading.Thread(
             target=self._watch_stop_marker,
@@ -932,25 +1187,36 @@ class TunnelDaemon:
             daemon=True,
             name="ponte-stop-watch",
         ).start()
+        threading.Thread(
+            target=self._watch_reload_marker,
+            args=(request_reload,),
+            daemon=True,
+            name="ponte-reload-watch",
+        ).start()
 
         log.info(
             "starting SSH retry loop(s) (max_retries=%s, %d profile(s))",
             self.config.retry.max_retries,
-            len(runners),
+            len(self._runners),
         )
         try:
-            for runner in runners:
+            for runner in self._runners:
                 runner.start()
             while not self._shutdown.is_set():
                 self._shutdown.wait(_SUPERVISOR_INTERVAL)
-                if not any(runner.is_alive() for runner in runners):
+                # ``self._runners`` is rebound (not mutated) by a reload, and
+                # during that swap it can briefly hold only retired runners;
+                # treating that as "all profiles died" would kill the daemon.
+                if self._reconciling.is_set():
+                    continue
+                if not any(runner.is_alive() for runner in self._runners):
                     log.warning("every profile loop has exited")
                     break
         except KeyboardInterrupt:  # pragma: no cover - must reload to trigger
             request_stop("KeyboardInterrupt")
         finally:
             request_stop("daemon shutdown")
-            for runner in runners:
+            for runner in self._runners:
                 runner.finish()
             self._cleanup()
         log.info("daemon exited cleanly")
@@ -973,6 +1239,134 @@ class TunnelDaemon:
                 request_stop("stop marker file present")
                 return
             self._shutdown.wait(_STOP_POLL_INTERVAL)
+
+    # -- Config reload (hot) ---------------------------------------------------
+
+    def request_reload(self) -> None:
+        """Ask a *running* daemon (another process) to re-read its config.
+
+        Drops the reload marker the daemon's watcher polls — the same
+        cross-process mechanism as the stop marker, so it works on Windows
+        where SIGHUP cannot be delivered. Returns as soon as the request is on
+        disk; the caller cannot observe the outcome synchronously, which is why
+        ``ponte reload`` validates the config *before* writing the marker.
+        """
+        directory = os.path.dirname(self.reload_marker)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(self.reload_marker, "w", encoding="utf-8") as handle:
+            handle.write(str(time.time()))
+
+    def _watch_reload_marker(self, request_reload: Callable[[], None]) -> None:
+        """Watch for a reload marker and apply the new config when it appears."""
+        while not self._shutdown.is_set():
+            if os.path.exists(self.reload_marker):
+                # Remove before reconciling: a request that lands mid-reload is
+                # then kept for the next sweep instead of being lost.
+                self._safe_remove(self.reload_marker)
+                request_reload()
+            self._shutdown.wait(_STOP_POLL_INTERVAL)
+
+    def _reload_worker(self) -> None:
+        """Run :meth:`_reconcile` and log its summary."""
+        summary = self._reconcile()
+        logging.getLogger("ponte.daemon").info("reload: %s", summary)
+
+    def _retire(self, runner: ProfileRunner) -> None:
+        """Stop a profile's loops and wait for its thread to end, best effort."""
+        try:
+            runner.finish()
+        except Exception as exc:  # noqa: BLE001 - one bad runner must not abort a reload
+            logger.warning(
+                "[%s] could not stop cleanly during reload: %s", runner.profile.name, exc
+            )
+
+    def _reconcile(self) -> str:
+        """Re-read the config file and apply it in place; returns a summary.
+
+        Only profiles whose configuration actually changed are restarted, so
+        adding a tunnel or fixing one profile's key no longer drops every other
+        connection. ``[retry]`` and ``[health]`` are baked into each runner at
+        construction time, so a change to either rebuilds every profile (the
+        connection must be re-established to pick up new policy).
+
+        Never raises: a broken or unreadable config leaves the running tunnels
+        exactly as they are and comes back as a message, because a reload that
+        can kill a working tunnel on a typo is worse than no reload at all.
+        """
+        source = self.config.source_path
+        if not source:
+            return "配置没有来源文件，未重载"
+        try:
+            new_config = load_config(source)
+        except ConfigError as exc:
+            logger.error("reload rejected, keeping the running config: %s", exc)
+            return f"重载失败，继续沿用旧配置：{exc}"
+
+        if not self._reload_lock.acquire(blocking=False):
+            return "已有一次重载在进行，忽略本次请求"
+        try:
+            self._reconciling.set()
+            policy_changed = (
+                new_config.retry != self.config.retry
+                or new_config.health != self.config.health
+            )
+
+            previous = {runner.profile.name: runner for runner in self._runners}
+            latest: list[ProfileRunner] = []
+            started: list[str] = []
+            kept: list[str] = []
+            for profile in new_config.profiles:
+                existing = previous.pop(profile.name, None)
+                unchanged = (
+                    existing is not None
+                    and not policy_changed
+                    and existing.profile == profile
+                )
+                if unchanged and existing is not None:
+                    latest.append(existing)
+                    kept.append(profile.name)
+                    continue
+                if existing is not None:
+                    self._retire(existing)
+                runner = ProfileRunner(profile, new_config, self)
+                runner.start()
+                latest.append(runner)
+                started.append(profile.name)
+
+            removed = sorted(previous)
+            for runner in previous.values():
+                self._retire(runner)
+
+            self._runners = latest
+            self.config = new_config
+            # Notify policy is global: rebuild the notifier and hand it to every
+            # runner, including the ones that were left running.
+            self.notifier = Notifier(new_config.notify)
+            for runner in latest:
+                runner.notifier = self.notifier
+
+            # Merge (don't overwrite) so the counters of surviving tunnels keep
+            # their history; the start time is preserved so daemon uptime does
+            # not reset on a reload.
+            self._store.begin(
+                new_config.profile_names, self._store.started_at() or time.time()
+            )
+            self._store.remove(removed)
+        finally:
+            self._reconciling.clear()
+            self._reload_lock.release()
+
+        parts: list[str] = []
+        if kept:
+            parts.append(f"保持 {len(kept)} 条（{', '.join(kept)}）")
+        if started:
+            parts.append(f"重启/新增 {len(started)} 条（{', '.join(started)}）")
+        if removed:
+            parts.append(f"移除 {len(removed)} 条（{', '.join(removed)}）")
+        if policy_changed:
+            parts.append("retry/health 策略有变，全部重建")
+        return "配置已重载：" + ("；".join(parts) if parts else "无变化")
 
     # -- Start / background ----------------------------------------------------
 
@@ -1009,6 +1403,15 @@ class TunnelDaemon:
     def _spawn_background(self) -> int:
         """Re-launch this CLI as a detached background process."""
         cmd = [sys.executable, *self._daemon_args()]
+        # Capture the child's first words instead of dropping them: if it cannot
+        # even import ponte (a wrong working directory, a broken install) it dies
+        # before it can log anything, and "did not write its PID file" on its own
+        # sends the user looking in the wrong place.
+        captured = _spawn_log_path(self.pid_file)
+        try:
+            handle = open(captured, "wb")
+        except OSError:
+            handle = None  # diagnostics are optional; never fail the spawn for it
         if sys.platform == "win32":
             flags = (
                 subprocess.DETACHED_PROCESS
@@ -1020,8 +1423,8 @@ class TunnelDaemon:
                 cwd=self.work_dir,
                 creationflags=flags,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=handle or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if handle else subprocess.DEVNULL,
             )
         else:
             # POSIX: start a new session so the child detaches from the
@@ -1031,16 +1434,22 @@ class TunnelDaemon:
                 cwd=self.work_dir,
                 start_new_session=True,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=handle or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if handle else subprocess.DEVNULL,
             )
+        if handle is not None:
+            handle.close()  # the child holds its own handle
         # Wait for the child to write its PID file (up to 10 s).
         for _ in range(100):
             pid = self.read_pid()
             if pid is not None:
+                if captured:
+                    self._safe_remove(captured)
                 return pid
             time.sleep(0.1)
-        raise RuntimeError("daemon did not write its PID file within 10 s")
+        raise RuntimeError(
+            "daemon did not write its PID file within 10 s" + _spawn_tail(captured)
+        )
 
     # -- Stop ------------------------------------------------------------------
 
@@ -1140,6 +1549,12 @@ class TunnelDaemon:
         destinations = {
             profile.name: profile.destination for profile in self.config.profiles
         }
+        # Same origin as the destination: the config as the *running* daemon read
+        # it, so a jump chain added to the file is not shown until the reload
+        # that actually puts it on the command line.
+        jumps = {
+            profile.name: profile.ssh.proxy_jump for profile in self.config.profiles
+        }
         return DaemonStatus(
             running=True,
             pid=pid,
@@ -1147,7 +1562,10 @@ class TunnelDaemon:
             uptime_seconds=max(0.0, uptime),
             profiles=[
                 _profile_status(
-                    name, sections.get(name, {}), destination=destinations.get(name)
+                    name,
+                    sections.get(name, {}),
+                    destination=destinations.get(name),
+                    jump=jumps.get(name),
                 )
                 for name in names
             ],
@@ -1492,6 +1910,7 @@ Write-Output 'installed'
         try:
             self._safe_remove(self.pid_file)
             self._safe_remove(self.stop_marker)
+            self._safe_remove(self.reload_marker)
         finally:
             self._shutdown.set()
 
