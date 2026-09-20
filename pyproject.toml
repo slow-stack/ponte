@@ -93,6 +93,11 @@ ignore = [
 # typer 要求 Option/Argument 作为参数默认值出现。
 "ponte/main.py" = ["B008"]
 
+[tool.ruff.lint.isort]
+# tests/ 下以单下划线开头的内部助手（"等待"与"负载注入"）是本仓库的代码，不是第三方
+# 包。不声明的话 ruff 会把它们归到第三方段，于是 import 分组传达的信息是错的。
+known-first-party = ["ponte", "_injection", "_waits"]
+
 [tool.mypy]
 python_version = "3.11"
 files = ["ponte"]
