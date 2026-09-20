@@ -1378,9 +1378,19 @@ def is_loopback_host(host: str) -> bool:
     if name.startswith("[") and name.endswith("]"):
         name = name[1:-1]
     try:
-        return ipaddress.ip_address(name).is_loopback
+        address = ipaddress.ip_address(name)
     except ValueError:
         return name.lower() == "localhost"
+    if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None:
+            # ``::ffff:127.0.0.1`` *is* the IPv4 loopback, but
+            # ``IPv6Address.is_loopback`` only learned about v4-mapped forms in
+            # 3.12 — the CI matrix measured 3.11 calling this spelling exposed,
+            # which would have demanded a token on one interpreter and not on
+            # another. Judging the address it stands for keeps the gate fixed.
+            return mapped.is_loopback
+    return address.is_loopback
 
 
 def ensure_bindable(host: str, token: str) -> None:

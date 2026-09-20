@@ -78,8 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that resolves wherever its owner points it, so configuring it exposed the
   dashboard (server addresses, login users, forwarded ports) to a public
   address with no token, which is the one thing `ensure_bindable` exists to
-  prevent. The address is now parsed with `ipaddress` and judged by
-  `is_loopback`, with `localhost` the only accepted name. Spellings the OS
+  prevent.  The address is now parsed with `ipaddress` and judged by
+  `is_loopback`, with `localhost` the only accepted name — and a v4-mapped
+  address (`::ffff:127.0.0.1`) is judged by the IPv4 address it stands for,
+  since `IPv6Address.is_loopback` only learned those forms in 3.12 (the CI
+  matrix had 3.11 demanding a token for the same spelling). Spellings the OS
   accepts but that parser rejects — the shorthand `127.1`, the absolute form
   `localhost.` — now count as exposed, so the remaining error is "demanded a
   token it did not need" rather than "skipped the token it did need".
