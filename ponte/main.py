@@ -10,10 +10,12 @@ Typical usage::
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
 import time
+import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -25,9 +27,16 @@ from rich.panel import Panel
 from rich.table import Table
 
 from ponte import __version__
-from ponte.config import ConfigError, get_config, init_config, set_config_path
+from ponte.config import (
+    ConfigError,
+    ServeConfig,
+    get_config,
+    init_config,
+    set_config_path,
+)
 from ponte.daemon import _format_duration
 from ponte.doctor import FAIL, OK, SKIP, WARN, counts, run_checks
+from ponte.serve import create_server, serve_url
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, runtime import is lazy
     from ponte.daemon import TunnelDaemon
@@ -283,6 +292,9 @@ def _add_daemon_rows(table: Table, s) -> None:  # noqa: ANN001 - DaemonStatus cy
 
 def _add_profile_rows(table: Table, profile) -> None:  # noqa: ANN001 - cycle guard
     """Append one profile's health, statistics and port states to *table*."""
+    # 目标放在第一行：多条隧道时，最先要说清的是“这张表是哪个服务器”。
+    if profile.destination:
+        table.add_row("目标", escape(profile.destination))
     table.add_row("健康状态", _markup_health(profile.healthy, profile.health_error))
 
     # 会话时长是区分“守护进程活了多久”与“隧道活了多久”的那一列。
@@ -323,6 +335,7 @@ def _round1(value: float | None) -> float | None:
 def _profile_payload(profile) -> dict:  # noqa: ANN001 - ProfileStatus cycle guard
     """Machine-readable snapshot of one profile (the ``--json`` contract)."""
     return {
+        "destination": profile.destination,
         "healthy": profile.healthy,
         "process_alive": profile.process_alive,
         "health_error": profile.health_error,
@@ -557,6 +570,96 @@ def watch(
 
 
 # ---------------------------------------------------------------------------
+# serve（本地 HTTP 看板 / 指标）
+# ---------------------------------------------------------------------------
+
+
+def _serve_config(
+    base: ServeConfig,
+    *,
+    host: str | None,
+    port: int | None,
+    token: str | None,
+    refresh: int | None,
+) -> ServeConfig:
+    """Apply ``ponte serve``'s command-line overrides to the ``[serve]`` section."""
+    return dataclasses.replace(
+        base,
+        host=base.host if host is None else host,
+        port=base.port if port is None else port,
+        token=base.token if token is None else token,
+        refresh=base.refresh if refresh is None else refresh,
+    )
+
+
+@app.command()
+def serve(
+    host: str | None = typer.Option(
+        None, "--host", help="监听地址（默认取 [serve].host，也就是只监听本机）"
+    ),
+    port: int | None = typer.Option(
+        None, "--port", min=1, max=65535, help="监听端口（默认取 [serve].port）"
+    ),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        help="访问令牌；绑定非回环地址时必须提供（写在命令行上会进 shell 历史，"
+        "长期使用建议写进 [serve].token）",
+    ),
+    refresh: int | None = typer.Option(
+        None, "--refresh", min=1, help="看板自动刷新间隔（秒）"
+    ),
+    open_browser: bool = typer.Option(False, "--open", help="启动后在浏览器里打开看板"),
+) -> None:
+    """启动本地 HTTP 服务：看板 / 、探活 /healthz、指标 /metrics、快照 /status.json。"""
+    try:
+        daemon = _daemon()
+        effective = _serve_config(
+            daemon.config.serve, host=host, port=port, token=token, refresh=refresh
+        )
+        # 与配置文件走同一条校验：绑定非回环地址却没有令牌时直接拒绝，
+        # 不提供“先跑起来再说”的选项。
+        effective.check_bind()
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(str(exc))
+
+    try:
+        server = create_server(
+            lambda: _status_payload(daemon.status()),
+            host=effective.host,
+            port=effective.port,
+            token=effective.token,
+            refresh=effective.refresh,
+        )
+    except OSError as exc:
+        _fail(
+            f"无法监听 {effective.host}:{effective.port}（{exc}）；"
+            "换一个端口：ponte serve --port 8788"
+        )
+
+    url = serve_url(effective.host, effective.port)
+    console.print(f"[green]ponte 看板已启动：{url}[/green]")
+    console.print(
+        f"[dim]指标 {url}metrics · 探活 {url}healthz · 快照 {url}status.json[/dim]"
+    )
+    if not effective.loopback:
+        console.print(
+            "[yellow]警告：已绑定非回环地址，同网段里拿到令牌的人都能看到你的服务器、"
+            "用户与端口；不要暴露到公网[/yellow]"
+        )
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]已停止看板[/yellow]")
+    finally:
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
 # test / check
 # ---------------------------------------------------------------------------
 
@@ -780,6 +883,14 @@ def config() -> None:
             f"channels={', '.join(notify.channels) or '（无）'}, "
             f"on_consecutive_failures={notify.on_consecutive_failures}, "
             f"cooldown={notify.cooldown}s",
+        )
+        # 令牌只报“有没有”，绝不回显：ponte config 的输出经常被粘进 issue。
+        serve = cfg.serve
+        table.add_row(
+            "serve",
+            f"host={serve.host}, port={serve.port}, "
+            f"token={'已设置' if serve.token else '（无）'}, "
+            f"refresh={serve.refresh}s",
         )
         table.add_row("pid_file", cfg.daemon.pid_file or "（默认）")
         table.add_row("log_file", cfg.daemon.log_file or "（默认）")

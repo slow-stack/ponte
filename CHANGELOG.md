@@ -36,8 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ponte`) and the repository name are unchanged, so an install from a
   checkout behaves exactly as before.
 - **The coverage gate moved from 70% to 80%.** The `[[profiles]]`, notify and
-  doctor work pushed the suite past it (~83%), so the threshold in `pyproject.toml`
+  doctor work pushed the suite past it (~84%), so the threshold in `pyproject.toml`
   now matches the codebase instead of trailing it by ten points.
+- **The tunnel target is part of the status now.** Each profile's status
+  carries the SSH `destination` it connects to (`ProfileStatus.destination`,
+  taken from the config rather than the status file), shown as the first row of
+  a `ponte status` table and included in `ponte status --json`. A table of
+  numbers is useless if you cannot tell which server the broken one is; the
+  dashboard labels every card with it.
 
 ### Added
 
@@ -105,6 +111,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is non-zero when anything failed, so it is usable from a script.
 - `[windows] pythonw_exe` — pin the windowless interpreter for the Scheduled
   Task, for installs where `pythonw.exe` does not sit next to `python.exe`.
+- **`ponte serve` — a local HTTP surface: dashboard, health probe and
+  Prometheus metrics.** `/` renders a self-contained dashboard (inline CSS, no
+  CDN, no JavaScript) with a card per tunnel: health, session age, availability,
+  forwarded-port state, the last disconnect and its reason, and the event feed.
+  `/healthz` is the endpoint to point a monitor at — it returns `503` when the
+  daemon is down *or* a tunnel is broken, and `200` (with `"status":
+  "starting"`) until the first health check completes, so a restart does not
+  page anyone. `/metrics` speaks the Prometheus text format (session age,
+  cumulative up/down time, availability, reconnect and port-listening state)
+  and deliberately always answers `200`, because a scrape failure would hide
+  *why* a tunnel went down — a graph's whole job. `/status.json` is exactly the
+  `ponte status --json` payload, so the page, the probe and the metrics can
+  never disagree with the CLI. Everything is read-only and re-read per request
+  (`Cache-Control: no-store`), and the whole thing is stdlib `http.server` — no
+  new dependency. Binds `127.0.0.1` by default; `[serve] host`/`port`/
+  `token`/`refresh` configure it, and a non-loopback bind **without** a token is
+  refused at config load and by `ponte serve` alike (the dashboard names your
+  servers, users and ports), with clients then passing `?token=` or
+  `Authorization: Bearer`.
 
 ### Planned
 

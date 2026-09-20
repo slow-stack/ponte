@@ -52,6 +52,9 @@ __all__ = [
     "HealthConfig",
     "WindowsConfig",
     "ServiceConfig",
+    "ServeConfig",
+    "ensure_bindable",
+    "is_loopback_host",
     "get_config",
     "load_config",
     "set_config_path",
@@ -358,6 +361,36 @@ class NotifyConfig:
 
 
 @dataclass(frozen=True)
+class ServeConfig:
+    """The optional local HTTP surface (``ponte serve``).
+
+    ``host`` defaults to loopback because every page under it names your
+    servers, users and forwarded ports — that is a map of your infrastructure,
+    not a status line. Binding anywhere else is allowed but *demands* a
+    ``token``: :func:`ensure_bindable` refuses rather than warns, for the same
+    reason the daemon refuses to install a task that would flash a console.
+
+    ``refresh`` is the dashboard's self-refresh interval in seconds. The JSON,
+    health and metrics endpoints are never cached, so this only affects how
+    often a browser redraws itself.
+    """
+
+    host: str = "127.0.0.1"
+    port: int = 8787
+    token: str = ""
+    refresh: int = 5
+
+    @property
+    def loopback(self) -> bool:
+        """``True`` when this bind address is reachable from this machine only."""
+        return is_loopback_host(self.host)
+
+    def check_bind(self) -> None:
+        """Raise :class:`ConfigValidationError` for an exposing configuration."""
+        ensure_bindable(self.host, self.token)
+
+
+@dataclass(frozen=True)
 class WindowsConfig:
     """Platform specific knobs used only on Windows.
 
@@ -579,6 +612,7 @@ class TunnelConfig:
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     windows: WindowsConfig = field(default_factory=WindowsConfig)
     service: ServiceConfig = field(default_factory=ServiceConfig)
+    serve: ServeConfig = field(default_factory=ServeConfig)
     source_path: str = ""
     """Absolute path of the TOML file this configuration was loaded from."""
     warnings: tuple[str, ...] = ()
@@ -695,6 +729,7 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
     notify = _parse_notify(data.get("notify", {}), warnings)
     windows = _parse_windows(data.get("windows", {}), warnings)
     service = _parse_service(data.get("service", {}), warnings)
+    serve = _parse_serve(data.get("serve", {}), warnings)
 
     cfg = TunnelConfig(
         profiles=profiles,
@@ -704,6 +739,7 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
         notify=notify,
         windows=windows,
         service=service,
+        serve=serve,
         source_path=config_path,
         warnings=tuple(warnings),
     )
@@ -726,6 +762,7 @@ _KNOWN_TOP_LEVEL = frozenset(
         "notify",
         "windows",
         "service",
+        "serve",
     }
 )
 _KNOWN_PROFILE = frozenset({"name", "ssh", "tunnels"})
@@ -757,6 +794,7 @@ _KNOWN_NOTIFY = frozenset(
 )
 _KNOWN_WINDOWS = frozenset({"task_name", "ssh_exe", "pythonw_exe", "run_as"})
 _KNOWN_SERVICE = frozenset({"name", "autostart", "kill_timeout"})
+_KNOWN_SERVE = frozenset({"host", "port", "token", "refresh"})
 
 
 def _warn_unknown_keys(
@@ -1051,6 +1089,26 @@ def _parse_notify(section: Any, warnings: list[str] | None = None) -> NotifyConf
     return notify
 
 
+def _parse_serve(section: Any, warnings: list[str] | None = None) -> ServeConfig:
+    if not section:
+        return ServeConfig()
+    _expect_table(section, "serve")
+    _warn_unknown_keys(section, _KNOWN_SERVE, "serve", warnings)
+    dft = ServeConfig()
+    serve = ServeConfig(
+        host=_optional_str(section, "host", default=dft.host),
+        port=_optional_int(
+            section, "port", default=dft.port, minimum=1, maximum=65535, where="serve"
+        ),
+        token=_optional_str(section, "token", default=""),
+        refresh=_optional_int(
+            section, "refresh", default=dft.refresh, minimum=1, where="serve"
+        ),
+    )
+    serve.check_bind()
+    return serve
+
+
 def _parse_windows(section: Any, warnings: list[str] | None = None) -> WindowsConfig:
     if not section:
         return WindowsConfig()
@@ -1085,6 +1143,33 @@ def _parse_service(section: Any, warnings: list[str] | None = None) -> ServiceCo
         kill_timeout=_optional_number(
             section, "kill_timeout", default=dft.kill_timeout, minimum=0.0, where="service"
         ),
+    )
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return ``True`` when *host* binds to this machine only.
+
+    Deliberately conservative: anything not obviously loopback is treated as
+    exposed. That includes ``""``, which ``http.server`` reads as *all
+    interfaces*, so an odd spelling cannot sneak past the token requirement in
+    :func:`ensure_bindable`.
+    """
+    name = host.strip().strip("[]").lower()
+    return name in ("localhost", "::1") or name.startswith("127.")
+
+
+def ensure_bindable(host: str, token: str) -> None:
+    """Refuse to expose the status surface to the network without a token.
+
+    Raises:
+        ConfigValidationError: when *host* is not loopback and *token* is empty.
+    """
+    if is_loopback_host(host) or token:
+        return
+    raise ConfigValidationError(
+        f"serve.host = {host!r} 会把看板暴露到网络上，必须同时设置 serve.token"
+        "（或命令行 --token）：看板会列出服务器地址、登录用户与转发端口，"
+        "没有令牌等于把内网拓扑摊开给同网段的任何人。"
     )
 
 

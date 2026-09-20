@@ -13,6 +13,7 @@ from ponte.config import (
     HealthConfig,
     Profile,
     RetryConfig,
+    ServeConfig,
     SSHConfig,
     SSHOptions,
     Tunnel,
@@ -554,3 +555,197 @@ def test_logs_follow_exits_on_interrupt(monkeypatch, tmp_path) -> None:
     result = CliRunner().invoke(app, ["logs", "--follow"])
     assert result.exit_code == 0
     assert "已停止跟随" in result.output
+
+
+# ---------------------------------------------------------------------------
+# ponte serve（本地 HTTP 看板）
+# ---------------------------------------------------------------------------
+
+
+class _FakeServeDaemon:
+    """``ponte serve`` 只用到 ``config.serve`` 与 ``status()``，假对象给这两个。"""
+
+    def __init__(self, serve: ServeConfig | None = None) -> None:
+        self.config = dataclasses.replace(
+            _cfg(), serve=serve if serve is not None else ServeConfig()
+        )
+
+    def status(self) -> DaemonStatus:
+        return _status(
+            ProfileStatus(
+                name="default",
+                destination="testuser@example.com:22",
+                healthy=True,
+            ),
+            running=True,
+            pid=4242,
+            uptime_seconds=10.0,
+        )
+
+
+class _FakeServer:
+    """记录 CLI 怎么启动/收尾服务器，不碰真 socket。"""
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.forever = False
+        self.closed = False
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        self.forever = True
+        raise KeyboardInterrupt
+
+    def server_close(self) -> None:
+        self.closed = True
+
+
+def _record_server(record: dict):
+    """返回一个可注入的 ``create_server``，把参数与 provider 记进 *record*。"""
+
+    def _create(provider, **kwargs) -> _FakeServer:
+        record["provider"] = provider
+        server = _FakeServer(**kwargs)
+        record["server"] = server
+        return server
+
+    return _create
+
+
+def test_serve_is_registered_in_help(monkeypatch) -> None:
+    monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
+    result = CliRunner().invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "serve" in result.output
+
+
+def test_serve_command_serves_and_stops_cleanly(monkeypatch) -> None:
+    monkeypatch.setattr("ponte.main._daemon", lambda: _FakeServeDaemon(ServeConfig(port=9100)))
+    record: dict = {}
+    monkeypatch.setattr("ponte.main.create_server", _record_server(record))
+
+    result = CliRunner().invoke(app, ["serve"])
+
+    assert result.exit_code == 0
+    assert "http://127.0.0.1:9100/" in result.output
+    assert record["server"].closed is True
+    assert record["server"].kwargs["port"] == 9100
+    # provider 必须现读现取：看板的“新鲜度”全靠它，缓存一次就失去意义。
+    payload = record["provider"]()
+    assert payload["profiles"]["default"]["healthy"] is True
+
+
+def test_serve_refuses_to_expose_without_a_token(monkeypatch) -> None:
+    """绑定非回环地址而没有令牌：直接拒绝，不提供“先跑起来再说”。"""
+    monkeypatch.setattr("ponte.main._daemon", lambda: _FakeServeDaemon())
+    monkeypatch.setattr("ponte.main.create_server", _record_server({}))
+
+    result = CliRunner().invoke(app, ["serve", "--host", "0.0.0.0"])
+
+    assert result.exit_code == 1
+    assert "token" in result.output
+
+
+def test_serve_command_line_overrides_win_and_warn(monkeypatch) -> None:
+    """命令行参数覆盖 [serve]，并就把看板摆到局域网的后果给出警告。"""
+    monkeypatch.setattr("ponte.main._daemon", lambda: _FakeServeDaemon(ServeConfig(port=8787)))
+    record: dict = {}
+    monkeypatch.setattr("ponte.main.create_server", _record_server(record))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "serve",
+            "--host", "0.0.0.0",
+            "--port", "9100",
+            "--token", "s3cret",
+            "--refresh", "30",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert record["server"].kwargs == {
+        "host": "0.0.0.0",
+        "port": 9100,
+        "token": "s3cret",
+        "refresh": 30,
+    }
+    assert "警告" in result.output
+
+
+def test_serve_open_launches_the_browser(monkeypatch) -> None:
+    monkeypatch.setattr("ponte.main._daemon", lambda: _FakeServeDaemon(ServeConfig(port=9100)))
+    monkeypatch.setattr("ponte.main.create_server", _record_server({}))
+    opened: list[str] = []
+    monkeypatch.setattr("ponte.main.webbrowser.open", opened.append)
+
+    result = CliRunner().invoke(app, ["serve", "--open"])
+
+    assert result.exit_code == 0
+    assert opened == ["http://127.0.0.1:9100/"]
+
+
+def test_serve_config_applies_only_given_overrides() -> None:
+    from ponte.main import _serve_config
+
+    base = ServeConfig(host="127.0.0.1", port=9100, token="t", refresh=7)
+    assert _serve_config(base, host=None, port=None, token=None, refresh=None) == base
+    changed = _serve_config(base, host="0.0.0.0", port=1, token="x", refresh=2)
+    assert changed == ServeConfig(host="0.0.0.0", port=1, token="x", refresh=2)
+
+
+def test_config_command_reports_serve_without_leaking_the_token(monkeypatch) -> None:
+    """ponte config 的输出经常被粘进 issue：令牌只报“有没有”。"""
+    cfg = dataclasses.replace(
+        _cfg(),
+        serve=ServeConfig(host="0.0.0.0", port=9100, token="s3cret", refresh=15),
+    )
+    monkeypatch.setattr("ponte.main.get_config", lambda: cfg)
+    result = CliRunner().invoke(app, ["config"])
+    assert result.exit_code == 0
+    assert "9100" in result.output
+    assert "已设置" in result.output
+    assert "s3cret" not in result.output
+
+
+def test_status_shows_the_target_destination(monkeypatch) -> None:
+    """多隧道时，最先要说清的是“这张表是哪个服务器”。"""
+    s = _status(
+        ProfileStatus(
+            name="default", destination="testuser@example.com:22", healthy=True
+        ),
+        running=True,
+        pid=1,
+        uptime_seconds=10.0,
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "testuser@example.com:22" in result.output
+
+
+def test_status_json_includes_destination(monkeypatch) -> None:
+    """--json 里也要有目标：监控脚本靠它区分是哪条隧道。"""
+    import json as _json
+
+    s = _status(
+        ProfileStatus(
+            name="default", destination="testuser@example.com:22", healthy=True
+        ),
+        running=True,
+        pid=7,
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    payload = _json.loads(result.output)
+    assert payload["profiles"]["default"]["destination"] == "testuser@example.com:22"

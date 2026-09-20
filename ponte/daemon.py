@@ -185,6 +185,11 @@ class ProfileStatus:
     """
 
     name: str
+    #: ``user@host:port`` this profile connects to, taken from the
+    #: configuration (not the status file). It is what makes a multi-profile
+    #: ``status --json`` / dashboard row self-describing: a table of numbers is
+    #: useless if you cannot tell which server is the broken one.
+    destination: str | None = None
     #: ``None`` until the first health check of this profile reports in.
     healthy: bool | None = None
     process_alive: bool | None = None
@@ -289,7 +294,9 @@ class DaemonStatus:
         return None
 
 
-def _profile_status(name: str, section: dict) -> ProfileStatus:
+def _profile_status(
+    name: str, section: dict, *, destination: str | None = None
+) -> ProfileStatus:
     """Build a :class:`ProfileStatus` from one status-file section.
 
     Tolerant on purpose: the file is written by whichever daemon version is
@@ -325,6 +332,7 @@ def _profile_status(name: str, section: dict) -> ProfileStatus:
     raw_alive = section.get("process_alive")
     return ProfileStatus(
         name=name,
+        destination=destination,
         healthy=raw_healthy if isinstance(raw_healthy, bool) else None,
         process_alive=raw_alive if isinstance(raw_alive, bool) else None,
         remote_ports=_ports("remote_ports"),
@@ -1129,13 +1137,19 @@ class TunnelDaemon:
         # daemon that still supervises it is stopped.
         names = list(self.profile_names)
         names += [name for name in sections if name not in names]
+        destinations = {
+            profile.name: profile.destination for profile in self.config.profiles
+        }
         return DaemonStatus(
             running=True,
             pid=pid,
             started_at=started,
             uptime_seconds=max(0.0, uptime),
             profiles=[
-                _profile_status(name, sections.get(name, {})) for name in names
+                _profile_status(
+                    name, sections.get(name, {}), destination=destinations.get(name)
+                )
+                for name in names
             ],
         )
 

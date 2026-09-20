@@ -12,7 +12,9 @@ from ponte.config import (
     ConfigParseError,
     ConfigValidationError,
     TunnelConfig,
+    ensure_bindable,
     get_config,
+    is_loopback_host,
     load_config,
 )
 
@@ -929,3 +931,132 @@ def test_profile_invalid_identity_file_is_named(tmp_path) -> None:
     ) + _profile_entry(tmp_path, "db")
     with pytest.raises(ConfigValidationError, match="web"):
         load_config(_write_toml(tmp_path, body))
+
+
+# ---------------------------------------------------------------------------
+# [serve] —— 本地 HTTP 看板
+# ---------------------------------------------------------------------------
+
+
+def _serve_config_file(tmp_path, section: str) -> str:
+    """一份最小可用配置，后面接上任意的 ``[serve]`` 段文本。"""
+    return _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+
+"""
+        + section,
+    )
+
+
+def test_serve_defaults_to_loopback(tmp_path) -> None:
+    """没有 [serve] 段时默认只监听本机：看板不需要用户做任何决定就应该是安全的。"""
+    serve = load_config(_minimal(tmp_path)).serve
+    assert serve.host == "127.0.0.1"
+    assert serve.port == 8787
+    assert serve.token == ""
+    assert serve.loopback is True
+
+
+def test_serve_section_is_parsed(tmp_path) -> None:
+    path = _serve_config_file(
+        tmp_path,
+        """
+[serve]
+host = "192.168.1.5"
+port = 9100
+token = "s3cret"
+refresh = 15
+""",
+    )
+    serve = load_config(path).serve
+    assert serve.host == "192.168.1.5"
+    assert serve.port == 9100
+    assert serve.token == "s3cret"
+    assert serve.refresh == 15
+    assert serve.loopback is False
+
+
+def test_serve_non_loopback_without_token_is_rejected(tmp_path) -> None:
+    """拒绝而不是警告：看板会列出服务器、用户与端口。"""
+    path = _serve_config_file(
+        tmp_path,
+        """
+[serve]
+host = "0.0.0.0"
+""",
+    )
+    with pytest.raises(ConfigValidationError, match="token"):
+        load_config(path)
+
+
+def test_serve_allows_an_explicit_non_loopback_bind_with_token(tmp_path) -> None:
+    """带上令牌就允许对外，把选择权交给用户而不是替他决定。"""
+    path = _serve_config_file(
+        tmp_path,
+        """
+[serve]
+host = "0.0.0.0"
+token = "s3cret"
+""",
+    )
+    assert load_config(path).serve.host == "0.0.0.0"
+
+
+def test_serve_port_must_be_in_range(tmp_path) -> None:
+    path = _serve_config_file(
+        tmp_path,
+        """
+[serve]
+port = 70000
+""",
+    )
+    with pytest.raises(ConfigValidationError, match="serve.port"):
+        load_config(path)
+
+
+def test_serve_unknown_key_warns(tmp_path) -> None:
+    """拼错的键要报出来，而不是默默用默认值。"""
+    path = _serve_config_file(
+        tmp_path,
+        """
+[serve]
+hsot = "127.0.0.1"
+""",
+    )
+    cfg = load_config(path)
+    assert any("serve.hsot" in warning for warning in cfg.warnings)
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", True),
+        ("127.1.2.3", True),
+        ("localhost", True),
+        ("LOCALHOST", True),
+        ("[::1]", True),
+        ("", False),
+        ("0.0.0.0", False),
+        ("::", False),
+        ("192.168.1.5", False),
+        ("example.com", False),
+    ],
+)
+def test_is_loopback_host(host, expected) -> None:
+    """白名单判定：不认识的写法一律当成“对外暴露”。
+
+    ``""`` 特别重要：``http.server`` 把空地址当成 *所有网卡*，所以它绝不是
+    回环地址，不能因为“看起来是空的”就放行。
+    """
+    assert is_loopback_host(host) is expected
+
+
+def test_ensure_bindable_treats_an_empty_host_as_exposed() -> None:
+    with pytest.raises(ConfigValidationError, match="token"):
+        ensure_bindable("", "")
+    ensure_bindable("", "s3cret")

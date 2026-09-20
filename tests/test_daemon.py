@@ -1072,3 +1072,36 @@ def test_service_tool_calls_go_through_run_tool(monkeypatch, tmp_path) -> None:
     assert args == ["systemctl", "--user", "daemon-reload"]
     assert kwargs["creationflags"] == creation_flags()
     assert kwargs["capture_output"] is True and kwargs["text"] is True
+
+
+def test_status_names_the_target_of_each_profile(tmp_path) -> None:
+    """每条隧道都要能说出自己连的是哪台服务器。
+
+    目标来自配置而不是状态文件（状态文件里就没有这个信息），所以它不能
+    因为 daemon 刚重启、还没上报而消失——否则看板上会出现一栏“健康的
+    未知服务器”，而多隧道时那正是最需要弄清楚的一件事。
+    """
+    cfg = _two_profile_cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    _live_pid(tmp_path)
+    d._store.begin(["web", "db"], started_at=time.time())
+
+    s = d.status()
+
+    assert [profile.destination for profile in s.profiles] == [
+        profile.destination for profile in cfg.profiles
+    ]
+    # 字面断言（而不是子串包含）：既钉死格式，也更严格。
+    assert s.profiles[0].destination == "testuser@web.example.com"
+
+
+def test_status_leaves_the_target_unknown_for_a_dropped_profile(tmp_path) -> None:
+    """配置里已删掉的 profile 还会显示（daemon 仍管着它），但没有目标可报。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    _live_pid(tmp_path)
+    d._store.begin(["default", "ghost"], started_at=time.time())
+
+    ghost = d.status().get_profile("ghost")
+
+    assert ghost is not None
+    assert ghost.destination is None

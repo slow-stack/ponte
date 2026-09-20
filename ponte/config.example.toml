@@ -143,6 +143,16 @@ cooldown = 900
 # webhook_url = "https://example.com/hooks/ponte"
 # 两个通道可以同时配。配好后用 `ponte notify-test` 验证真能收到。
 
+[serve]
+# 本地 HTTP 看板 / 指标（ponte serve）。默认只监听本机：看板会列出服务器
+# 地址、登录用户与转发端口，等于一张内网拓扑图，因此默认不对外。
+host = "127.0.0.1"
+port = 8787
+# 想让局域网或反向代理访问就必须设一个令牌，否则 ponte serve 直接拒绝启动。
+# 客户端用 ?token=... 或 Authorization: Bearer ... 带上它。
+# token = "一个足够长的随机串"
+refresh = 5                # 看板自动刷新间隔（秒）；接口本身从不缓存
+
 [service]
 # 开机自启服务身份（Linux systemd 单元名 / macOS launchd label 后缀）
 name = "ponte"

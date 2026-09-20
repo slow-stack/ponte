@@ -56,6 +56,11 @@
 - 🩺 **`ponte doctor`** — one command that checks the config, the key file and
   its permissions, SSH reachability, listening ports, auto-start status and the
   notify channel, each row ending in a concrete fix instead of a black box.
+- 📊 **A dashboard and a metrics endpoint** — `ponte serve` puts the same status
+  on HTTP: `/` is a self-contained dashboard (no CDN, no JavaScript), `/healthz`
+  answers `503` when a tunnel is actually broken, `/metrics` speaks Prometheus
+  and `/status.json` is exactly `ponte status --json`. Loopback-only by default;
+  exposing it needs an explicit token.
 - 🖥️ **Cross-platform** — resolves `ssh` automatically, per-platform runtime
   paths, and portable remote-port probing (`socket` → `ss`/`lsof`/`netstat`).
 
@@ -90,12 +95,68 @@ import package stay `ponte`; a checkout installs the same way (`pipx install .`)
 | `check [--profile NAME]` | verify tunnel ports are listening (`-R` on the server, `-L`/`-D` locally) |
 | `doctor [--offline] [--timeout S]` | one-shot checkup of config, key, connectivity, ports, auto-start and notifications, each row with a fix |
 | `notify-test [--profile NAME]` | send a test alert through the configured ntfy / webhook channels |
+| `serve [--host H] [--port P] [--token T] [--open]` | local HTTP dashboard, `/healthz` probe, Prometheus `/metrics`, `/status.json` snapshot |
 | `install` / `uninstall` | register / remove the OS auto-start service |
 | `config` | print the effective configuration, its source file and any warnings |
 
 Global options (before the command): `--config/-c PATH` pin a config file,
 `--version/-V` print the version. Unknown/typo'd config keys are reported by
 `ponte config` instead of being silently ignored.
+
+## 📊 Web dashboard & monitoring
+
+`ponte watch` is for the machine you are sitting at; `ponte serve` is for
+everything else — a browser, a phone on the same host, Uptime Kuma, Prometheus.
+
+```bash
+ponte serve            # http://127.0.0.1:8787/  (loopback only by default)
+ponte serve --open     # ...and open it in your browser
+```
+
+| Endpoint | What it answers |
+|----------|-----------------|
+| `/` | the dashboard: per-tunnel health, session age, availability, port state, last disconnect with its reason, event feed |
+| `/healthz` | `200` while the tunnels work, `503` as soon as one is broken — the endpoint to point a monitor at |
+| `/metrics` | Prometheus text exposition: session age, cumulative up/down time, availability, reconnects, port-listening state |
+| `/status.json` | exactly the payload of `ponte status --json` |
+
+**Why `/healthz` and `/metrics` disagree on purpose.** `/healthz` fails, so a
+monitor can alert; `/metrics` always answers `200` and reports state as numbers,
+because a scrape failure would hide *why* a tunnel went down — which is exactly
+what a graph exists to show. And `/healthz` reports `starting` (with `200`) until
+the first health check completes, so restarting the daemon does not page you.
+
+**Security.** The dashboard names your servers, users and forwarded ports — it
+is a map of your infrastructure, not a status line. So `ponte serve` binds
+`127.0.0.1` and nothing else. Binding a LAN or public address is possible, but
+only together with a token; ponte *refuses* the combination of "exposed" and
+"no token" instead of warning about it:
+
+```toml
+[serve]
+host = "0.0.0.0"                  # opt in, deliberately
+port = 8787
+token = "a-long-random-string"    # required for any non-loopback host
+refresh = 5                       # dashboard auto-refresh, seconds
+# ipv6 hosts are fine too: host = "::1"
+```
+
+Clients then pass `?token=...` (handy for scrapers) or `Authorization: Bearer
+...`. All four endpoints are read-only, re-read the daemon status per request and
+send `Cache-Control: no-store`, so a page can never show a stale "healthy" for a
+tunnel that has since died.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: ponte
+    static_configs:
+      - targets: ["127.0.0.1:8787"]
+    # with a token: metrics_path: /metrics?token=a-long-random-string
+```
+
+Alert on `ponte_profile_port_listening == 0` for the signal that matters most:
+a live process whose forwarded port is gone is the classic silent failure.
 
 ## 🛠️ Cross-platform service management
 
@@ -128,6 +189,8 @@ ponte (local daemon, Python)
 - `health.py` — periodic liveness + remote-port checks
 - `notify.py` — ntfy / webhook alerts on repeated failures
 - `doctor.py` — one-shot diagnostics used by `ponte doctor`
+- `serve.py` — read-only HTTP surface (dashboard / health probe / metrics) over
+  the same payload `ponte status --json` emits
 - `config.py` — TOML load/validate (built-in `tomllib` on 3.11+)
 
 ## ⚙️ Configuration
@@ -186,6 +249,9 @@ Sections:
 | Connection rejected after key change | delete `known_hosts`, reconnect (`StrictHostKeyChecking=accept-new` default) |
 | Process alive but remote port down | cloud security-group inbound rules; check server with `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` — the daemon now force-reconnects a "zombie" tunnel after 3 consecutive failed checks |
 | Console window flashes at logon, or while stopping | the Scheduled Task must run `pythonw.exe` — check `[windows] pythonw_exe`; `ponte stop` also force-kills through a hidden `taskkill` |
+| `ponte serve` exits with "cannot bind" / port busy | another process holds the port — `ponte serve --port 8788`; the refused non-loopback bind is a *token* problem, and the message says so |
+| `/healthz` returns `401` | a `[serve].token` is set: pass `?token=...` or `Authorization: Bearer ...` |
+| `/healthz` returns `503` while the tunnel looks fine | it reports the *tunnel*, not the process: read `unhealthy` / `errors` in the body, then `ponte check` |
 | Logs | `ponte logs -n 100 --follow` |
 
 ## 🧪 Development & testing
@@ -251,6 +317,10 @@ again. See [CONTRIBUTING.md](CONTRIBUTING.md).
   让你在真出事**之前**就验证通道可用。默认关闭：不开启就绝不会外发任何数据。
 - 🩺 **`ponte doctor`** — 一条命令逐项体检：配置、密钥及其权限、SSH 连通性、
   监听端口、开机自启状态、通知通道，每行都给出具体修法而不是留个黑箱。
+- 📊 **看板与指标接口** — `ponte serve` 把同一份状态摆到 HTTP 上：`/` 是自包含的
+  看板（不依赖 CDN、不用 JavaScript），`/healthz` 在隧道真的断时回 `503`，
+  `/metrics` 说 Prometheus 格式，`/status.json` 就是 `ponte status --json`。
+  默认只监听本机；要对外必须先给令牌。
 - 🖥️ **跨平台** — 自动查找 `ssh`、按平台落盘运行时文件、可移植的远程端口探测
   （`socket` → `ss`/`lsof`/`netstat`）。
 
@@ -284,12 +354,65 @@ ponte install           # 注册开机自启 + 崩溃重启
 | `check [--profile NAME]` | 检查隧道端口（`-R` 在服务器上，`-L`/`-D` 在本机） |
 | `doctor [--offline] [--timeout S]` | 一键体检配置、密钥、连通性、端口、自启与通知，每项给出修法 |
 | `notify-test [--profile NAME]` | 通过已配置的 ntfy / webhook 通道发一条测试通知 |
+| `serve [--host H] [--port P] [--token T] [--open]` | 本地 HTTP 看板、`/healthz` 探活、Prometheus `/metrics`、`/status.json` 快照 |
 | `install` / `uninstall` | 注册 / 移除开机自启服务 |
 | `config` | 打印生效配置、来源文件与配置告警 |
 
 全局选项（写在子命令之前）：`--config/-c PATH` 指定配置文件，
 `--version/-V` 打印版本。拼错/未知的配置项会由 `ponte config` 报出来，
 不再被静默忽略。
+
+## 📊 网页看板与监控接入
+
+`ponte watch` 给坐在机器前的你看，`ponte serve` 给其它一切：浏览器、手机
+（同机）、Uptime Kuma、Prometheus。
+
+```bash
+ponte serve            # http://127.0.0.1:8787/（默认只监听本机）
+ponte serve --open     # 顺手在浏览器里打开
+```
+
+| 接口 | 回答什么问题 |
+|------|--------------|
+| `/` | 看板：逐条隧道的健康、当前会话时长、在线率、端口状态、上次断线原因与事件流 |
+| `/healthz` | 隧道正常时 `200`，任一条断开立即 `503` —— 监控就探这个 |
+| `/metrics` | Prometheus 文本格式：会话时长、累计在线/离线、在线率、重连次数、端口监听状态 |
+| `/status.json` | 与 `ponte status --json` 完全一致的载荷 |
+
+**为什么 `/healthz` 与 `/metrics` 故意不一致。** `/healthz` 会失败，监控才能
+报警；`/metrics` 永远回 `200`，把状态当数字报出来——因为采挂掉会盖住
+“它为何挂了”，而那正是画图的目的。另外首次健康检查完成前，`/healthz`
+报的是 `starting`（`200`），所以重启守护进程不会造成误报。
+
+**安全模型。** 看板会列出你的服务器地址、登录用户与转发端口——这是一张
+内网拓扑图，不是一行状态。所以 `ponte serve` 只绑 `127.0.0.1`。绑到局域网或
+公网是可以的，但**必须**同时给令牌：ponte 对“对外 + 无令牌”的组合是直接
+拒绝，而不是警告一句了事。
+
+```toml
+[serve]
+host = "0.0.0.0"                  # 显式选择对外
+port = 8787
+token = "一个足够长的随机串"      # 非回环地址必需
+refresh = 5                       # 看板自动刷新秒数
+# 也支持 IPv6：host = "::1"
+```
+
+客户端用 `?token=...`（脚本/采集器方便）或 `Authorization: Bearer ...`。
+四个接口全是只读、每次请求都重新读取守护进程状态，并带
+`Cache-Control: no-store`——所以页面不会拿旧的“健康”去骗一个已经挂了的隧道。
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: ponte
+    static_configs:
+      - targets: ["127.0.0.1:8787"]
+    # 带令牌时：metrics_path: /metrics?token=一个足够长的随机串
+```
+
+最值得拿来报警的一条是 `ponte_profile_port_listening == 0`：进程活着、
+转发端口却没了，正是那种悄无声息的典型故障。
 
 ## 🛠️ 跨平台服务管理
 
@@ -325,6 +448,8 @@ ponte（本地守护进程，Python）
 - `health.py` — 周期存活 + 远程端口检查
 - `notify.py` — 连续失败时的 ntfy / webhook 告警
 - `doctor.py` — `ponte doctor` 使用的体检项
+- `serve.py` — 只读 HTTP 接口（看板 / 探活 / 指标），渲染的就是
+  `ponte status --json` 那份载荷
 - `config.py` — TOML 加载/校验（3.11+ 内置 `tomllib`）
 
 ## ⚙️ 配置
@@ -363,6 +488,8 @@ ponte（本地守护进程，Python）
   `cooldown`（同一 profile 两条告警之间的最小秒数），以及通道：
   `ntfy_topic`（可选 `ntfy_server` / `ntfy_token`）和/或 `webhook_url`
   （以 JSON 形式收到告警）
+- `[serve]` — 本地看板：`host`（默认 `127.0.0.1`）、`port`（默认 `8787`）、
+  `token`（绑定非回环地址时必填，否则拒绝启动）、`refresh`（看板刷新秒数）
 - `[service]` — 服务名、自启、POSIX 强杀等待
 - `[windows]` — 仅 Windows 使用（`task_name`、`ssh_exe`、`pythonw_exe`、
   `run_as`）。`run_as` 默认 `user`（登录后以你本人身份运行、能读 `~/.ssh`）或
@@ -378,6 +505,9 @@ ponte（本地守护进程，Python）
 | 换 key 后连接被拒 | 删除 `known_hosts` 重连（默认 `StrictHostKeyChecking=accept-new`） |
 | 进程活着但远程端口不通 | 云安全组入方向规则；服务器上 `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` 确认监听 —— 守护进程已支持假死检测：连续 3 次检查失败自动强制重连 |
 | 登录时（或 `stop` 时）闪出黑色控制台窗口 | 计划任务必须跑 `pythonw.exe`——检查 `[windows] pythonw_exe`；`ponte stop` 的强杀也已隐藏控制台 |
+| `ponte serve` 报绑定失败 / 端口占用 | 换端口：`ponte serve --port 8788`；若报的是非回环地址，那是**令牌**问题，报错里写了 |
+| `/healthz` 返回 `401` | 配了 `[serve].token`：带上 `?token=...` 或 `Authorization: Bearer ...` |
+| 隧道看着正常，`/healthz` 却回 `503` | 它报的是**隧道**不是进程：看响应体里的 `unhealthy` / `errors`，再用 `ponte check` 复核 |
 | 排查日志 | `ponte logs -n 100 --follow` |
 
 ## 🧪 开发与测试
