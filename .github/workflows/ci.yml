@@ -60,6 +60,37 @@ jobs:
           flags: ${{ matrix.os }}-py${{ matrix.python-version }}
           fail_ci_if_error: false
 
+  # 依赖时序的断言只会**随机**报红：main 上 Python 3.11 (macos-latest) 就因为
+  # "睡 0.3 秒后至少 3 次检查"拿到 2 而红过一次——不是产品代码错，而是断言考的是
+  # "这台机器够快"。这条腿把那种机器搬进 CI：往工作线程注入延迟（见
+  # tests/conftest.py），于是这类测试**当场**失败，而不是某天随机变红。
+  #
+  # 只跑一个 OS/版本：它的价值在确定性，不在覆盖率——版本/平台差异由上面的矩阵负责。
+  timing:
+    name: Timing guard (injected thread latency)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project with dev deps
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      # 故意不加 `-q`：报告头里的那行横幅就是"守卫真的开着"的证据，下一行 grep 它。
+      # 一条静默失效的注入会把这条腿变成空跑，而输出仍然是绿的。
+      - name: Run tests with injected latency
+        env:
+          PONTE_TEST_THREAD_DELAY: "0.15"
+        run: |
+          set -o pipefail
+          pytest 2>&1 | tee slow-runner.log
+          grep -q "thread latency: +0.15s" slow-runner.log
+
   build:
     name: Build & verify wheel
     runs-on: ubuntu-latest
