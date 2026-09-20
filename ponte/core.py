@@ -212,7 +212,7 @@ class TunnelManager:
         """
         args = self.build_args()
         logger.info("Launching: %s", " ".join(args))
-        self.process = subprocess.Popen(
+        proc = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -228,12 +228,22 @@ class TunnelManager:
             close_fds=True,
             creationflags=creation_flags(),
         )
+        self.process = proc
         self._connected_at = time.monotonic()
         # Drain stderr on a daemon thread: the pipe can never fill up (which
         # would stall SSH), and disconnect reasons are logged in real time
         # instead of only after the session ends.
+        #
+        # The process is handed to the thread rather than read from
+        # ``self.process`` inside it. That attribute is cleared as soon as the
+        # session ends (``finally`` below), and no amount of being fast prevents
+        # the *other* direction: a thread that is scheduled late starts after the
+        # clear, finds ``None``, and silently drains nothing — a busy machine
+        # turns this into "the pipe nobody reads", which is the failure this
+        # thread exists to prevent.
         threading.Thread(
             target=self._drain_stderr,
+            args=(proc,),
             name="ponte-ssh-stderr",
             daemon=True,
         ).start()
@@ -247,15 +257,18 @@ class TunnelManager:
         finally:
             self.process = None
 
-    def _drain_stderr(self) -> None:
-        """Read the SSH child's stderr line by line until EOF.
+    def _drain_stderr(self, proc: subprocess.Popen | None) -> None:
+        """Read the stderr of *proc* line by line until EOF.
 
         Runs on a daemon thread for the lifetime of the session. Prevents the
         ``stderr=PIPE`` buffer from filling up and logs server-side disconnect
         reasons (e.g. ``Connection to host closed by remote host``) as they
         happen, so a dropped tunnel is diagnosable even after the fact.
+
+        ``proc`` is a parameter, not ``self.process``: see ``connect()`` — the
+        session that owns this pipe must keep being drained even if this thread
+        only reaches its first line after ``connect()`` returned.
         """
-        proc = self.process
         if proc is None or proc.stderr is None:
             return
         try:

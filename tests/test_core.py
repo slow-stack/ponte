@@ -9,10 +9,10 @@ from __future__ import annotations
 import dataclasses
 import subprocess
 import sys
-import time
 
 import pytest
 
+from _waits import wait_for
 from ponte.config import (
     JumpHop,
     Profile,
@@ -416,8 +416,38 @@ def test_connect_logs_stderr(monkeypatch, caplog) -> None:
     tm = TunnelManager(_cfg())
     with caplog.at_level("WARNING", logger="ponte.core"):
         tm.connect()
-        time.sleep(0.05)  # give the stderr drain thread a moment to flush
-    assert "auth failed" in caplog.text
+        # 这里曾经是 ``time.sleep(0.05)`` "给 drain 线程一点时间"——那是在断言这台机器
+        # 够快（慢 runner 上 drain 线程就是排不到，测试随机红）。能等的只有"日志记录
+        # 出现"这个事实本身，所以等它，等不到 5 秒才算失败。
+        wait_for(
+            lambda: any("auth failed" in r.getMessage() for r in caplog.records),
+            lambda: f"drain 线程没有记录 stderr："
+            f"{[r.getMessage() for r in caplog.records]!r}",
+        )
+    assert "SSH stderr: auth failed" in caplog.text
+
+
+def test_drain_stderr_reads_the_process_it_was_handed(caplog) -> None:
+    """drain 线程要读的进程必须随线程一起传进去，而不是事后读 ``self.process``。
+
+    ``connect()`` 的 ``finally`` 会把 ``self.process`` 清成 ``None``。线程被调度得
+    晚一点（慢 runner 上很常见）就会读到 ``None``，于是整条 stderr 没人读——而
+    ``stderr=PIPE`` 的缓冲区填满、把 SSH 别住，正是这条线程存在的理由。
+
+    这里直接钉住那个契约：即使 ``self.process`` 已经是 ``None``，交给这条线程的
+    进程照样得被读完。上面那条测试只能靠**调度很晚**才能发现这个竞态（所以它需要
+    时序注入），这条不需要。
+    """
+
+    class _Proc:
+        def __init__(self) -> None:
+            self.stderr = iter((b"Connection to host closed by remote host\n",))
+
+    tm = TunnelManager(_cfg())
+    tm.process = None  # 就是 connect() 返回之后的状态
+    with caplog.at_level("WARNING", logger="ponte.core"):
+        tm._drain_stderr(_Proc())
+    assert "SSH stderr: Connection to host closed by remote host" in caplog.text
 
 
 def test_connect_records_last_session_duration(monkeypatch) -> None:

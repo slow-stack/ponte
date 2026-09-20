@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A busy machine could leave the SSH session's stderr unread.** `connect()`
+  hands the child's stderr to a daemon thread so the pipe can never fill up and
+  server-side disconnects are logged while they happen. That thread read the
+  process from `self.process` *after* it was scheduled, while `connect()` clears
+  that attribute the moment the session ends — so a thread that reached its
+  first line late found `None` and drained nothing at all, leaving unread the
+  very pipe it exists to keep empty (once the buffer fills, SSH stalls). The
+  process is now handed to the thread when it is created. This was found by the
+  new scheduling injection, not by reading the code: it is a race whose window
+  is tiny on an idle machine and wide open on a loaded one.
 - **A failed health probe was reported as a dead port — and could kill a healthy
   tunnel.** The server-side probe is an SSH connection of its own, and when that
   connection failed (a reset, provider-side rate limiting, our own timeout kill)
