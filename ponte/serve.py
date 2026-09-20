@@ -1374,6 +1374,32 @@ class PonteHTTPServer(ThreadingHTTPServer):
         super().__init__(address, PonteRequestHandler)
 
 
+#: Longest log line ponte writes for one request. The request line arrives
+#: straight off the socket, so its length is the client's choice — http.server
+#: will read up to 64 KiB of it, and a log line that long is a flood.
+_LOG_TEXT_LIMIT = 500
+
+
+def _sanitize_log(text: str) -> str:
+    """Neutralise characters that could forge a log line, and cap the length.
+
+    ``BaseHTTPRequestHandler`` hands us the request line as it came off the
+    socket (decoded as latin-1, so every byte above 0x7f becomes a character),
+    and :meth:`PonteRequestHandler.log_message` funnels ``log_error`` here too.
+    That text can therefore carry ESC sequences, NUL, DEL, C1 bytes or bidi
+    overrides — enough to make a log file claim something it never saw, or a
+    terminal render something it never received. ``str.isprintable`` is ``False``
+    for exactly those classes (``Cc``/``Cf``/``Zl``/``Zp``) while keeping
+    ordinary spaces, so each offender becomes a visible ``?`` instead of an
+    invisible instruction. The cap keeps a 64 KiB request line from becoming a
+    64 KiB log line.
+    """
+    cleaned = "".join(char if char.isprintable() else "?" for char in text)
+    if len(cleaned) <= _LOG_TEXT_LIMIT:
+        return cleaned
+    return cleaned[:_LOG_TEXT_LIMIT] + "…"
+
+
 class PonteRequestHandler(BaseHTTPRequestHandler):
     """Serves the four read-only endpoints; one instance per connection."""
 
@@ -1389,8 +1415,13 @@ class PonteRequestHandler(BaseHTTPRequestHandler):
         return cast(PonteHTTPServer, self.server)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        """Route the stdlib's stderr chatter into the ponte logger."""
-        logger.debug("%s %s", self.address_string(), format % args)
+        """Route the stdlib's stderr chatter into the ponte logger.
+
+        Everything logged for a request — including the raw request line, and
+        whatever :meth:`log_error` passes on — goes through :func:`_sanitize_log`
+        first, because none of it is ours.
+        """
+        logger.debug("%s %s", self.address_string(), _sanitize_log(format % args))
 
     # -- methods -----------------------------------------------------------
 
