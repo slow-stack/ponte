@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
 
 import pytest
 
+from _waits import join_thread, wait_for, wait_for_values
 from ponte.config import HealthConfig
 from ponte.core import ProbeError
 from ponte.health import HealthChecker, HealthStatus
@@ -175,12 +175,11 @@ def test_run_loop_stops_cleanly() -> None:
     monitor = next((t for t in threading.enumerate() if t not in before_threads), None)
     assert monitor is not None, "run_loop 没有起后台线程"
 
-    _wait_for_values(seen, 3)
+    wait_for_values(seen, 3)
 
     checks_at_stop = len(seen)
     stop.set()
-    monitor.join(timeout=5)
-    assert not monitor.is_alive(), "设置停止事件后循环没有退出"
+    join_thread(monitor, what="健康监控线程", timeout=5)
     # 已经进入 check() 的那一轮仍会回调一次（实现只保证在 wait 之前查一次事件），
     # 再多就说明停止没生效。线程已 join，计数此后不会再变，所以这是确定性的。
     late = len(seen) - checks_at_stop
@@ -196,7 +195,7 @@ def test_run_loop_callback_error_swallowed() -> None:
         raise ValueError("cb boom")
 
     stop = hc.run_loop(interval=0.02, callback=bad_cb)
-    _wait_for(
+    wait_for(
         lambda: isinstance(hc.last_callback_error, ValueError),
         lambda: f"回调异常没被记录：{hc.last_callback_error!r}",
     )
@@ -298,31 +297,6 @@ def test_backoff_interval_formula() -> None:
     assert HealthChecker._backoff_interval(60.0, 10, 300.0) == 300.0
 
 
-def _wait_for(
-    predicate: Callable[[], bool],
-    describe: Callable[[], str],
-    timeout: float = 5.0,
-) -> None:
-    """Wait for *predicate* on a deadline, instead of napping a fixed time.
-
-    固定秒数的 ``sleep`` 断言的是"这台机器够快"，而不是被测行为。``describe``
-    是个函数：失败信息要在**等过之后**才取，否则它记的是等待前那一刻的状态。
-    """
-    deadline = time.time() + timeout
-    while not predicate() and time.time() < deadline:
-        time.sleep(0.01)
-    assert predicate(), describe()
-
-
-def _wait_for_values(values: list, n: int, timeout: float = 5.0) -> None:
-    """Busy-wait until ``values`` has at least ``n`` entries."""
-    _wait_for(
-        lambda: len(values) >= n,
-        lambda: f"captured only {len(values)} values, need {n}",
-        timeout,
-    )
-
-
 def _fake_wait_recorder(
     monkeypatch, waits: list[float], released: threading.Event
 ) -> None:
@@ -366,7 +340,7 @@ def test_run_loop_backoff_after_failures(monkeypatch) -> None:
     _fake_wait_recorder(monkeypatch, waits, released)
 
     hc.run_loop(interval=1.0)
-    _wait_for_values(waits, 6)
+    wait_for_values(waits, 6)
     released.set()
     _stop_health_thread()
 
@@ -412,7 +386,7 @@ def test_run_loop_backoff_resets_after_recovery(monkeypatch) -> None:
     _fake_wait_recorder(monkeypatch, waits, released)
 
     hc.run_loop(interval=1.0)
-    _wait_for_values(waits, 7)
+    wait_for_values(waits, 7)
     released.set()
     _stop_health_thread()
 

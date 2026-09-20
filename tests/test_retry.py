@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import time
 
+from _waits import join_thread
 from ponte.config import RetryConfig
 from ponte.retry import RetryEvent, RetryRunner
 
@@ -59,10 +60,12 @@ def test_basic_connect_stop_flow() -> None:
             if ev.type == RetryEvent.RETRYING:
                 runner.stop()
 
-    t = threading.Thread(target=driver)
+    t = threading.Thread(target=driver, name="retry-driver")
     t.start()
-    time.sleep(0.3)
-    t.join()
+    # 这里曾经先 ``time.sleep(0.3)`` 再 ``join()``。那个 0.3 既不是约束也不是事实，
+    # 只是"希望此时它已经跑完了"；慢 runner 上它什么也没保证。join 才是这段真正
+    # 要的等待，而且它同时证明了驱动线程会自己退出（不会把套件挂住）。
+    join_thread(t, what="重试驱动线程", timeout=10)
 
     assert events[0][0] == RetryEvent.CONNECTING, events
     idx = [e[0] for e in events]

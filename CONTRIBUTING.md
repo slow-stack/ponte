@@ -33,17 +33,25 @@ python _smoke_test.py           # zero-dependency smoke check
 
 Coverage has a `fail_under` threshold in `pyproject.toml`; don't let it drop.
 CI runs lint + types on Linux, the same test suite on Windows / Linux / macOS ×
-Python 3.11 / 3.12, and a `build` job that installs the wheel and runs
+Python 3.11–3.14, a job that re-runs it under a C locale / half-hour timezone
+with deprecations as errors, and a `build` job that installs the wheel and runs
 `ponte init`. Coverage is uploaded to Codecov.
 
-One more job re-runs the suite with `PONTE_TEST_THREAD_DELAY=0.15`. That variable
-makes `tests/conftest.py` inject latency into worker-thread sleeps and waits, so a
+One more job re-runs the suite with two independent injections (`tests/_injection.py`):
+`PONTE_TEST_THREAD_DELAY=0.15` stretches every worker-thread sleep and wait, and
+`PONTE_TEST_THREAD_START_DELAY=0.15` holds a freshly started thread before it runs
+its first line. The second one matters because it is unreachable by the first: a
+thread that has not started executing yet has no waits to stretch. Either way, a
 test that only passes because the machine is fast fails there **every time**
 instead of flaking once in a while. Run it the same way before blaming a runner:
 
 ```bash
-PONTE_TEST_THREAD_DELAY=0.15 pytest     # 慢机器模拟（Git Bash / POSIX 语法）
+PONTE_TEST_THREAD_DELAY=0.15 PONTE_TEST_THREAD_START_DELAY=0.15 pytest
 ```
+
+If you add an assertion that waits for something a background thread produces, wait
+for a deadline (see `tests/_waits.py`) rather than for a fixed number of seconds;
+the guard job is what turns the difference into a failure instead of a flake.
 
 ## Project layout
 
@@ -157,18 +165,23 @@ python _smoke_test.py           # 零依赖冒烟检查
 ```
 
 覆盖率在 `pyproject.toml` 里有 `fail_under` 阈值，请勿让它回落。CI 会在
-Linux 上跑 lint + 类型检查，在 Windows / Linux / macOS × Python 3.11 / 3.12
-上跑同一套测试，另有 `build` 任务会安装 wheel 并执行 `ponte init`。覆盖率
-上报到 Codecov。
+Linux 上跑 lint + 类型检查，在 Windows / Linux / macOS × Python 3.11–3.14
+上跑同一套测试，另有一个任务在 C locale / 半时区偏移下、并把弃用告警当错误地跑一遍，
+以及 `build` 任务会安装 wheel 并执行 `ponte init`。覆盖率上报到 Codecov。
 
-还有一个任务会用 `PONTE_TEST_THREAD_DELAY=0.15` 再跑一遍：这个变量让
-`tests/conftest.py` 往工作线程的 sleep/wait 里注入延迟，于是“只有机器够快才
-通过”的测试会**每次都**在那里失败，而不是偶发地红一次。怀疑是 runner 抽风之前，
-先这样在本地跑一遍：
+还有一个任务会用两个互相独立的注入（见 `tests/_injection.py`）再跑一遍：
+`PONTE_TEST_THREAD_DELAY=0.15` 把工作线程的每次 sleep/wait 拉长；
+`PONTE_TEST_THREAD_START_DELAY=0.15` 让刚 `start()` 的线程迟迟跑不到第一行。
+后者是前者够不到的：还没开始执行的线程没有任何等待可以被拉长——而它在空闲机器上
+永远通过、在忙机器上随机失败。两者共同的效果是：“只有机器够快才通过”的测试会
+**每次都**在那里失败，而不是偶发地红一次。怀疑是 runner 抽风之前，先这样在本地跑一遍：
 
 ```bash
-PONTE_TEST_THREAD_DELAY=0.15 pytest     # 模拟慢机器（Git Bash / POSIX 语法）
+PONTE_TEST_THREAD_DELAY=0.15 PONTE_TEST_THREAD_START_DELAY=0.15 pytest
 ```
+
+如果你要写“等后台线程产出某件东西”的断言，请等截止时间（见 `tests/_waits.py`），
+不要睡一个固定秒数；守卫任务存在的意义就是把这个差别从偶发红变成必然红。
 
 ## 项目结构
 

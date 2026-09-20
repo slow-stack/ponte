@@ -324,14 +324,18 @@ python _smoke_test.py                          # zero-dependency quick check
 ```
 
 CI runs lint + types on Linux, and the test suite across
-Windows/Linux/macOS × Python 3.11/3.12, reporting coverage to
+Windows/Linux/macOS × Python 3.11–3.14, reporting coverage to
 [Codecov](https://codecov.io/gh/modusensus/ponte). One extra job re-runs the
-suite with `PONTE_TEST_THREAD_DELAY=0.15`: that injects latency into
-worker-thread sleeps and waits, so a test that only passes on a fast machine
-fails there *every* time instead of flaking once in a while. Set the same
-variable locally to reproduce such a machine. A `build` job also installs
-the built wheel and runs `ponte init`, so a packaging regression cannot ship
-again. See [CONTRIBUTING.md](CONTRIBUTING.md).
+suite with `PONTE_TEST_THREAD_DELAY=0.15` **and**
+`PONTE_TEST_THREAD_START_DELAY=0.15`: the first stretches every worker-thread
+sleep and wait, the second holds a freshly started thread before its first line
+runs (a case no amount of wait-stretching can reach). A test that only passes on
+a fast machine fails there *every* time instead of flaking once in a while. Set
+the same variables locally to reproduce such a machine. Another job runs the
+suite under a C locale (non-UTF-8 stdio) in a half-hour timezone with
+deprecation warnings as errors, and a `build` job installs the built wheel and
+runs `ponte init`, so a packaging regression cannot ship again. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## 📝 Notes
 
@@ -629,12 +633,14 @@ python _smoke_test.py                          # 零依赖快速自检
 ```
 
 CI 在 Linux 上跑 lint + 类型检查，在 Windows/Linux/macOS × Python
-3.11/3.12 上跑测试，覆盖率上报到
-[Codecov](https://codecov.io/gh/modusensus/ponte)。另有一个任务会用
-`PONTE_TEST_THREAD_DELAY=0.15` 再跑一遍：它往工作线程的 sleep/wait 里注入
-延迟，于是"只有机器够快才通过"的测试会**每次都**在那里失败，而不是偶发地
-红一次。本地设同一个变量即可复现这种机器。`build` 任务会安装打好的 wheel 并
-执行 `ponte init`，避免打包问题再次溜进发布。详见
+3.11–3.14 上跑测试，覆盖率上报到
+[Codecov](https://codecov.io/gh/modusensus/ponte)。另有一个任务会同时用
+`PONTE_TEST_THREAD_DELAY=0.15` 与 `PONTE_TEST_THREAD_START_DELAY=0.15` 再跑
+一遍：前者把工作线程的每次 sleep/wait 拉长，后者让刚 start() 的线程迟迟跑不到
+第一行（后半种情况没有任何等待可以被拉长）。于是"只有机器够快才通过"的测试会
+**每次都**在那里失败，而不是偶发地红一次。本地设同样两个变量即可复现这种机器。
+还有一个任务在 C locale（非 UTF-8 的 stdio）、半时区偏移下跑，并把弃用告警当错误；
+`build` 任务会安装打好的 wheel 并执行 `ponte init`，避免打包问题再次溜进发布。详见
 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 📝 注意事项
