@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 
 import pytest
 
 from ponte.config import (
+    DEFAULT_BIND_HOST,
     ConfigError,
     ConfigNotFoundError,
     ConfigParseError,
     ConfigValidationError,
     JumpHop,
+    ServeConfig,
     TunnelConfig,
     daemon_paths_from_file,
     ensure_bindable,
@@ -1070,25 +1074,125 @@ def test_is_loopback_host(host, expected) -> None:
     assert is_loopback_host(host) is expected
 
 
-@pytest.mark.parametrize(
-    "host",
+#: 由回环网段**生成**的写法，而不是手写若干例子。这个文件里那几个 bug 都活在
+#: “按什么判定”里（拿字符串前缀当网段、拿库函数当版本无关的真相），而这类错误
+#: 恰恰挑不出几个例子就碰不到——所以语料得是生成的。
+_LOOPBACK_ADDRESSES = [
+    f"127.{a}.{b}.{c}"
+    for a in (0, 1, 128, 254, 255)
+    for b in (0, 1, 128, 254, 255)
+    for c in (0, 1, 128, 254, 255)
+]
+
+#: 必须判为对外的东西：生成出来的“像回环”的名字，加上明摆着外部的地址。
+#: ``127.<a>.<b>.<c>.example`` 就是当年从我眼皮下钻过去的那类形状。
+_EXPOSED_HOSTS = (
     [
-        "127.corp.example",
+        f"127.{a}.{b}.{c}.example"
+        for a in (0, 1, 200, 255)
+        for b in (0, 1, 200, 255)
+        for c in (0, 1, 200)
+    ]
+    + [
+        f"host.{a}.{b}.{c}.internal"
+        for a in (0, 127)
+        for b in (0, 1)
+        for c in (0, 1)
+    ]
+    + [
+        "127.example.com",
         "127.0.0.1.example.com",
         "127.0.0.1.",
-        "127.attacker.tld",
-    ],
+        "localhost.",
+        "localhost.evil.example",
+        "notlocalhost",
+        "",
+        " ",
+        "0.0.0.0",
+        "::",
+        "::2",
+        "2001:db8::1",
+        "fe80::1",
+        "169.254.169.254",
+    ]
+    + [
+        f"{a}.{b}.{c}.{d}"
+        for a, b, c in ((10, 0, 0), (172, 16, 0), (192, 168, 1), (100, 64, 0))
+        for d in (0, 1, 254, 255)
+    ]
 )
-def test_is_loopback_host_rejects_names_that_merely_start_with_127(host) -> None:
-    """前缀匹配会放行**主机名**，而名字解析到哪里由域名所有者决定。
+
+
+def test_exposure_is_never_taken_back_by_a_clever_spelling() -> None:
+    """判定为对外的东西，不能因为写法狡猾而被当成本机。
 
     ``is_loopback_host`` 是 ``ensure_bindable`` 唯一的判据，也就是看板（服务器
     地址、登录用户、转发端口）与网络之间的全部防线：放行一个能解析到公网的名字
-    等于无令牌把内网拓扑绑出去。
+    等于无令牌把内网拓扑绑出去。名单由生成得到，所以"换一批例子"骗不过它。
     """
-    assert is_loopback_host(host) is False
-    with pytest.raises(ConfigValidationError):
-        ensure_bindable(host, "")
+    for host in _EXPOSED_HOSTS:
+        assert is_loopback_host(host) is False, host
+        with pytest.raises(ConfigValidationError):
+            ensure_bindable(host, "")
+
+
+def test_cosmetic_rewrites_do_not_change_the_verdict() -> None:
+    """空白、方括号与大小写只是拼写差异，不能翻转判定。
+
+    反过来说：任何**改动字符串形状**的判定方式都得在这里站得住，这正是旧的
+    ``startswith("127.")`` 站不住的地方——它让拼写参与了安全判定。
+    """
+    for host in _LOOPBACK_ADDRESSES + ["::1", "::ffff:127.0.0.1", "localhost"]:
+        assert is_loopback_host(host) is True, host
+        for rewritten in (f"  {host}  ", f"[{host}]", host.upper(), host.lower()):
+            assert is_loopback_host(rewritten) is True, rewritten
+
+
+def test_a_mapped_spelling_is_judged_like_the_address_it_stands_for() -> None:
+    """``::ffff:A.B.C.D`` 就是 ``A.B.C.D``，两者的判定必须一致。
+
+    这条不变量与解释器版本无关，而它盯住的 bug 恰恰是版本相关的：3.11 的
+    ``IPv6Address.is_loopback`` 不认 v4-mapped 形式，于是同一个地址在 3.11 上
+    要令牌、在 3.12 上不要——令牌门禁建在库函数上，就等于建在解释器版本上。
+    写成不变量之后，CI 的 3.11 腿就盯得住它。
+    """
+    for ipv4 in (
+        "127.0.0.1",
+        "127.9.9.9",
+        "10.0.0.1",
+        "192.168.1.5",
+        "0.0.0.0",
+        "169.254.169.254",
+    ):
+        assert is_loopback_host(f"::ffff:{ipv4}") is is_loopback_host(ipv4), ipv4
+
+
+def test_the_kernel_binds_every_safe_default_to_loopback() -> None:
+    """不变量：我们放行的写法，系统真的只把它绑在本机上。
+
+    这个方向是问系统、不问自己：``localhost`` 走的是本机解析器，与我们的字符串
+    逻辑无关。只覆盖系统确实肯绑的写法（macOS 只为 lo 配了 127.0.0.1，绑
+    ``127.1.2.3`` 会被拒——那属于“能不能用”，与“判得对不对”无关），所以
+    ``OSError`` 会跳过而不是当成通过：判定本身已由上面两个用例锁住。
+    """
+    for host in ("127.0.0.1", "127.1.2.3", "127.255.255.254", "localhost", "::1"):
+        assert is_loopback_host(host) is True, host
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((host, 0))
+            except OSError:
+                continue
+            bound = sock.getsockname()[0]
+        assert ipaddress.ip_address(bound).is_loopback, (host, bound)
+
+
+def test_the_shipped_default_needs_no_token() -> None:
+    """开箱即用的默认值必须免令牌，否则 ``ponte serve`` 默认就起不来。"""
+    assert ServeConfig().host == DEFAULT_BIND_HOST
+    assert is_loopback_host(DEFAULT_BIND_HOST) is True
+    ensure_bindable(DEFAULT_BIND_HOST, "")
+    ensure_bindable(ServeConfig().host, "")
 
 
 def test_ensure_bindable_treats_an_empty_host_as_exposed() -> None:
