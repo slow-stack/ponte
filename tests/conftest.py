@@ -59,6 +59,12 @@ def _install_thread_delay(delay: float) -> None:
     and ``time.sleep``. Clocks (``time.monotonic``) are deliberately left alone —
     moving those would corrupt deadlines instead of emulating load. A ``sleep(0)``
     is a yield rather than a wait, and load does not stretch it, so it stays.
+
+    Scope, honestly: this emulates *a worker that waits or is scheduled late*,
+    which is the failure mode behind the CI flake this exists for. It does not
+    emulate *a worker starved of CPU* — a test that naps on the main thread while
+    a worker does real work is untouched by it and still relies on the runner
+    being fast. Don't read a green run here as "no timing assumptions left".
     """
     main_thread = threading.main_thread()
     real_sleep = time.sleep
