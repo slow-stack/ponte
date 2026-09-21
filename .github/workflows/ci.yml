@@ -71,10 +71,15 @@ jobs:
   #   - 线程被 start() 了但迟迟跑不到第一行（等待被拉长管不到这种——它没有任何等待
   #     可拉长）。这条轴真的抓到过东西：它让 TunnelManager.connect 里 stderr drain
   #     线程的竞态（读已被清空的 self.process）从"偶尔"变成"每次"。
+  #   - 有竞争者在真的烧 CPU。前两条轴说的都是"线程晚了"，而且都只花墙钟——睡觉的线程
+  #     不占谁的 CPU，所以"这段预算里该算完多少活"这一类断言能从它们下面走过去。第三条
+  #     轴让工作线程每次 sleep/wait 都真的占一段 CPU，于是在 GIL 上留下真的竞争；代价与
+  #     工作线程自己的活动成比例，而不是一条 24/7 的 hog 线程——那种做法实测把 pytest 的
+  #     收集阶段从 0.43s 变成 30s，记录留在 tests/_injection.py 里。
   #
   # 只跑一个 OS/版本：它的价值在确定性，不在覆盖率——版本/平台差异由上面的矩阵负责。
   timing:
-    name: Timing guard (injected thread latency)
+    name: Timing guard (injected latency, CPU share)
     runs-on: ubuntu-latest
 
     steps:
@@ -88,17 +93,23 @@ jobs:
       - name: Install project with dev deps
         run: python -m pip install --upgrade pip && pip install -e ".[dev]"
 
-      # 故意不加 `-q`：报告头里的那两行横幅就是"守卫真的开着"的证据，下面 grep 它们。
+      # 故意不加 `-q`：报告头里的三行横幅就是"守卫真的开着"的证据，下面 grep 它们。
       # 一条静默失效的注入会把这条腿变成空跑，而输出仍然是绿的。
-      - name: Run tests with injected latency
+      #
+      # CPU 轴取 0.05s：默认的 GIL 切换间隔是 5ms，所以每次烧 CPU 都确定会被抢占至少
+      # 一次——"竞争"是真的发生，而不只是一段更长的计算。开销与工作线程自己的活动成
+      # 比例：套件里能被它触及的 worker sleep/wait 只有约 40 次，于是总共约 2 秒。
+      - name: Run tests with injected latency and CPU contention
         env:
           PONTE_TEST_THREAD_DELAY: "0.15"
           PONTE_TEST_THREAD_START_DELAY: "0.15"
+          PONTE_TEST_THREAD_CPU: "0.05"
         run: |
           set -o pipefail
           pytest 2>&1 | tee slow-runner.log
           grep -q "thread latency: +0.15s" slow-runner.log
           grep -q "thread start delay: +0.15s" slow-runner.log
+          grep -q "worker CPU share: +0.05s" slow-runner.log
 
   # 一条腿覆盖三个"环境"维度（不是平台维度，平台由上面的矩阵负责）。合成一条是因为
   # 它们都是同一件事的不同侧面：**这台机器不是开发者那台**。出错时 traceback 会指出

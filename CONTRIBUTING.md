@@ -37,16 +37,22 @@ Python 3.11–3.14, a job that re-runs it under a C locale / half-hour timezone
 with deprecations as errors, and a `build` job that installs the wheel and runs
 `ponte init`. Coverage is uploaded to Codecov.
 
-One more job re-runs the suite with two independent injections (`tests/_injection.py`):
-`PONTE_TEST_THREAD_DELAY=0.15` stretches every worker-thread sleep and wait, and
+One more job re-runs the suite with three independent injections (`tests/_injection.py`):
+`PONTE_TEST_THREAD_DELAY=0.15` stretches every worker-thread sleep and wait,
 `PONTE_TEST_THREAD_START_DELAY=0.15` holds a freshly started thread before it runs
-its first line. The second one matters because it is unreachable by the first: a
-thread that has not started executing yet has no waits to stretch. Either way, a
-test that only passes because the machine is fast fails there **every time**
-instead of flaking once in a while. Run it the same way before blaming a runner:
+its first line, and `PONTE_TEST_THREAD_CPU=0.05` makes every worker sleep/wait also
+burn real CPU. Each axis is unreachable by the others, which is why there are three
+rather than one: a thread that has not started executing yet has no waits to
+stretch, and a *sleeping* thread takes nobody's CPU — so an assertion about how
+much work fits in a fixed budget walks straight past the first two and only fails
+under the third. Either way, a test that only passes because the machine is fast
+fails there **every time** instead of flaking once in a while. Run it the same way
+before blaming a runner:
 
 ```bash
-PONTE_TEST_THREAD_DELAY=0.15 PONTE_TEST_THREAD_START_DELAY=0.15 pytest
+PONTE_TEST_THREAD_DELAY=0.15 \
+  PONTE_TEST_THREAD_START_DELAY=0.15 \
+  PONTE_TEST_THREAD_CPU=0.05 pytest
 ```
 
 If you add an assertion that waits for something a background thread produces, wait
@@ -169,15 +175,20 @@ Linux 上跑 lint + 类型检查，在 Windows / Linux / macOS × Python 3.11–
 上跑同一套测试，另有一个任务在 C locale / 半时区偏移下、并把弃用告警当错误地跑一遍，
 以及 `build` 任务会安装 wheel 并执行 `ponte init`。覆盖率上报到 Codecov。
 
-还有一个任务会用两个互相独立的注入（见 `tests/_injection.py`）再跑一遍：
+还有一个任务会用三个互相独立的注入（见 `tests/_injection.py`）再跑一遍：
 `PONTE_TEST_THREAD_DELAY=0.15` 把工作线程的每次 sleep/wait 拉长；
-`PONTE_TEST_THREAD_START_DELAY=0.15` 让刚 `start()` 的线程迟迟跑不到第一行。
-后者是前者够不到的：还没开始执行的线程没有任何等待可以被拉长——而它在空闲机器上
-永远通过、在忙机器上随机失败。两者共同的效果是：“只有机器够快才通过”的测试会
-**每次都**在那里失败，而不是偶发地红一次。怀疑是 runner 抽风之前，先这样在本地跑一遍：
+`PONTE_TEST_THREAD_START_DELAY=0.15` 让刚 `start()` 的线程迟迟跑不到第一行；
+`PONTE_TEST_THREAD_CPU=0.05` 让工作线程每次 sleep/wait 额外真的烧一段 CPU。
+为什么是三条而不是一条：每条都够不到另两条——还没开始执行的线程没有任何等待可以被
+拉长；而**正在睡觉**的线程不占任何人的 CPU，所以“这段预算里该算完多少活”这类断言
+从这两条下面直接走过去，只在第三条下才失败。它们共同的效果是：“只有机器够快才通过”
+的测试会**每次都**在那里失败，而不是偶发地红一次。怀疑是 runner 抽风之前，先这样在
+本地跑一遍：
 
 ```bash
-PONTE_TEST_THREAD_DELAY=0.15 PONTE_TEST_THREAD_START_DELAY=0.15 pytest
+PONTE_TEST_THREAD_DELAY=0.15 \
+  PONTE_TEST_THREAD_START_DELAY=0.15 \
+  PONTE_TEST_THREAD_CPU=0.05 pytest
 ```
 
 如果你要写“等后台线程产出某件东西”的断言，请等截止时间（见 `tests/_waits.py`），
