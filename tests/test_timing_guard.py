@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from _injection import START_DELAY_ENV, THREAD_DELAY_ENV, active
+from _injection import START_DELAY_ENV, THREAD_CPU_ENV, THREAD_DELAY_ENV, active
 
 _INJECTION = active()
 
@@ -59,6 +59,73 @@ threading.Thread(target=worker, daemon=True).start()
 time.sleep(float(os.environ["PROBE_NAP"]))
 if not seen:
     raise SystemExit("worker did not run within the fixed nap")
+'''
+
+
+#: 第三条轴的探针："这段固定的 CPU 工作量应该在这个预算内跑完"——这正是头两条轴
+#: 够不到的那类断言（它们模拟的是"谁什么时候跑到"，不是"这段时间能算多少"）。
+#: 预算是按机器标定出来的**时长**（秒），不是固定的循环次数：固定次数在快机器上短到
+#: 装不下几个竞争周期，效果就被抹平（实测在一个 CI runner 上只有 1.79，而本机 3.1）。
+_PROBE_SECONDS = "0.3"
+_PROBE_COMPETITORS = "3"
+#: 同一档里重复几轮取最快的一次：外部负载只会把时间**拖长**，取最小值就是各档真实
+#: 水平的一致估计，而不会把"机器正好忙"算成"这条轴起了作用"。
+_PROBE_REPEATS = "2"
+#: 刻意比 CI 用的 0.05s 夸张（同 ``_PROBE_START_DELAY``）：这条自检要在任何机器上
+#: 确定性地分出高下，而不是复现 CI 的取值。
+_PROBE_CPU_SHARE = "0.10"
+
+#: 判据：被饿着的那次必须比两个基线都快这么多。实测的比值：本机 3.1，最坏一次 1.79
+#: （CI 的 3.13/ubuntu 腿）；而"关掉注入"与"只拉长等待"几乎一样（约 1.0，最坏 1.2）。
+#: 取 1.3 是**实测最坏值的一半以下**——这条自检自己也不能变成"只有机器够快才通过"的
+#: 断言，否则它就是在重犯它要防的错。把 ``_burn`` 禁掉后比值落到 0.94，仍稳稳地在
+#: 判据之下（已复现），所以放宽容度不等于失去灵敏度。
+_MIN_SLOWDOWN = 1.3
+
+#: 探针源码刻意全 ASCII：C locale 下（见 ci.yml 的 env-edges 腿）非 ASCII 连
+#: ``-c`` 的 argv 都传不进子进程（``os.posix_spawn`` 抛 UnicodeEncodeError）。
+_CPU_CONTENTION_PROBE = '''
+import os
+import threading
+import time
+
+import _injection
+
+_injection.active()
+
+unit = 200000
+began = time.perf_counter()
+total = 0
+for i in range(unit):
+    total += i * i
+unit_seconds = max(time.perf_counter() - began, 1e-6)
+work = max(unit, int(unit * float(os.environ["PROBE_SECONDS"]) / unit_seconds))
+
+stop = threading.Event()
+
+
+def worker():
+    event = threading.Event()
+    while not stop.is_set():
+        event.wait(0.001)
+
+
+for _ in range(int(os.environ["PROBE_COMPETITORS"])):
+    threading.Thread(target=worker, daemon=True).start()
+
+time.sleep(0.2)
+
+best = None
+for _ in range(int(os.environ["PROBE_REPEATS"])):
+    began = time.perf_counter()
+    total = 0
+    for i in range(work):
+        total += i * i
+    elapsed = time.perf_counter() - began
+    best = elapsed if best is None else min(best, elapsed)
+
+stop.set()
+print(best)
 '''
 
 
@@ -118,6 +185,96 @@ def test_start_delay_holds_a_new_thread_before_its_body_runs() -> None:
         assert latency < 0.25, latency
 
 
+def _contention_probe(*, delay: str, cpu: str) -> float:
+    """在子进程里跑一次固定 CPU 预算，返回它花掉的秒数。
+
+    子进程自带开关（而不是继承本进程的），所以这条自检在**任何**配置下都有效——包括
+    注入全关的普通矩阵腿里：它验证的是机制本身，而不是"CI 那一步恰好开着"。
+    """
+    env = os.environ.copy()
+    for name in (
+        "COV_CORE_SOURCE",
+        "COV_CORE_CONFIG",
+        "COV_CORE_DATAFILE",
+        "PYTEST_CURRENT_TEST",
+        THREAD_DELAY_ENV,
+        START_DELAY_ENV,
+        THREAD_CPU_ENV,
+    ):
+        env.pop(name, None)
+    env[THREAD_DELAY_ENV] = delay
+    env[THREAD_CPU_ENV] = cpu
+    env["PROBE_SECONDS"] = _PROBE_SECONDS
+    env["PROBE_COMPETITORS"] = _PROBE_COMPETITORS
+    env["PROBE_REPEATS"] = _PROBE_REPEATS
+    tests_dir = str(Path(__file__).parent)
+    env["PYTHONPATH"] = tests_dir + os.pathsep + env.get("PYTHONPATH", "")
+    done = subprocess.run(
+        [sys.executable, "-c", _CPU_CONTENTION_PROBE],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    return float(done.stdout.strip())
+
+
+def test_cpu_share_slows_a_competing_thread_where_delays_cannot() -> None:
+    """第三条轴的**独有**覆盖：同一段 CPU 工作量，在竞争者真的烧 CPU 时明显变慢。
+
+    两个基线缺一不可，因为一个比值本身说明不了"是谁干的"：关掉注入那次给出这台机器
+    本来多快；``delay`` 那次才是重点——**拉长等待做不到这件事**。睡觉的线程不占 CPU，
+    所以"工作线程缺 CPU"这类断言在 delay 轴下照样通过，这正是第三条轴存在的理由。
+    """
+    quiet = _contention_probe(delay="0", cpu="0")
+    delayed = _contention_probe(delay="0.15", cpu="0")
+    starved = _contention_probe(delay="0", cpu=_PROBE_CPU_SHARE)
+    assert starved >= max(quiet, delayed) * _MIN_SLOWDOWN, (
+        f"quiet={quiet:.3f}s delayed={delayed:.3f}s starved={starved:.3f}s "
+        f"(ratio={starved / max(quiet, delayed):.2f}, need {_MIN_SLOWDOWN})"
+    )
+
+
+def _thread_cpu_spent_in_a_wait(seconds: float, *, in_worker: bool) -> float:
+    """一次 ``Event.wait(seconds)`` 花掉**本线程**多少 CPU 秒。
+
+    ``time.thread_time()`` 而不是墙钟：这样断言是"花/不花 CPU"的类别差别，不随机器
+    快慢漂移，也不会因为 runner 忙而误报。
+    """
+    spent: list[float] = []
+
+    def run() -> None:
+        before = time.thread_time()
+        threading.Event().wait(seconds)
+        spent.append(time.thread_time() - before)
+
+    if in_worker:
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+    else:
+        run()
+    assert spent, "the wait never completed"
+    return spent[0]
+
+
+def test_cpu_share_burns_worker_threads_and_not_the_main_thread() -> None:
+    """第三条轴只让**工作线程**花 CPU；主线程那次等待一毫秒都不多。
+
+    主线程这一半与第一条轴同理（见 ``_injection``）：把测试自己的时间也拿去竞争，会
+    让"测试的预算"和"被测代码的预算"一起变，比例不变、什么都测不出来。
+    """
+    worker_cpu = _thread_cpu_spent_in_a_wait(0.02, in_worker=True)
+    main_cpu = _thread_cpu_spent_in_a_wait(0.02, in_worker=False)
+    if _INJECTION.thread_cpu:
+        assert worker_cpu >= _INJECTION.thread_cpu * 0.6, worker_cpu
+        assert main_cpu < _INJECTION.thread_cpu * 0.3, main_cpu
+    else:
+        assert worker_cpu < 0.02, worker_cpu
+        assert main_cpu < 0.02, main_cpu
+
+
 def _conftest_header() -> str:
     """The header our own conftest contributes, via the module pytest loaded."""
     # 不调 pytestconfig.hook：那个钩子是 firstresult，返回的是**别的插件**的结果；
@@ -141,6 +298,7 @@ def test_injection_is_announced_in_the_report_header() -> None:
         assert _INJECTION.banner() in header, header
     else:
         assert "thread latency" not in header, header
+        assert "worker CPU share" not in header, header
         assert "thread start delay" not in header, header
 
 
