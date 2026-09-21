@@ -199,6 +199,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ponte serve --demo` serves the dashboard on built-in sample data.** The page
+  names your servers, users and ports, so the only ways to look at it without a
+  tunnel were to run it against real infrastructure or to hand-write a status
+  file — and a hand-written one drifts from the payload contract while looking
+  exactly like the real thing. `--demo` reads no config and never touches a
+  daemon: it drives a small deterministic timeline that connects, drops, backs
+  off and reconnects on its own, so the page shows every state it can render —
+  healthy, broken, and *unknown* (a probe that could not answer, where the ports
+  read `未观测` rather than `未监听`). It labels itself in three places —
+  `"demo": true` in `/status.json`, a `演示数据` pill and a footer note on the
+  page, and a yellow line on the terminal — because a dashboard screenshot must
+  not be mistakable for somebody's real infrastructure. Sample hosts are
+  `example.com`. The bind rules are unchanged: a non-loopback `--host` still
+  demands a token.
 - **The jump chain is part of the status, next to the destination.**
   `ProfileStatus.jump` carries the `ssh -J` value, so `ponte status --json` and
   the dashboard can tell "cannot reach the server" apart from "cannot reach the

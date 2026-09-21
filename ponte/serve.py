@@ -783,7 +783,7 @@ button.pause:hover { color: var(--text); border-color: var(--accent); }
 <main id="board">$board</main>
 <footer>
   <span class="live" id="live">每 $refresh 秒自动刷新（无脚本时整页刷新）</span>
-  <button class="pause" id="pauser" type="button" hidden>暂停</button>
+  <button class="pause" id="pauser" type="button" hidden>暂停</button>$demo_note
   <span class="links">数据来自 ponte status 的同一份状态，点任意一行看明细 ·
   <a href="/status.json">status.json</a> ·
   <a href="/metrics">metrics</a> ·
@@ -1075,6 +1075,16 @@ def _feed(section: Mapping[str, Any]) -> str:
     return "".join(lines)
 
 
+def _demo_note(payload: Mapping[str, Any]) -> str:
+    """Footer line for ``ponte serve --demo``: says where the data came from, in words."""
+    if not payload.get("demo"):
+        return ""
+    return (
+        '\n  <span class="muted">演示模式：内置示例数据（example.com），不是你的隧道；'
+        "看自己的状态请用 <code>ponte status</code> / <code>ponte serve</code></span>"
+    )
+
+
 def _identity(name: str, section: Mapping[str, Any]) -> str:
     """Who this tunnel is: its name, verdict, destination and jump chain."""
     parts = [
@@ -1238,7 +1248,21 @@ def _tunnel(name: str, section: Mapping[str, Any], *, now: float) -> str:
 
 
 def _summary(payload: Mapping[str, Any], profiles: Mapping[str, Any]) -> str:
-    """The header: the verdict, one tile per state that occurs, then daemon facts.
+    """The header, with a leading marker when this payload is ``ponte serve --demo`` data.
+
+    The marker comes first because it qualifies *everything* after it: a screenshot of
+    this page must never be readable as somebody's real infrastructure. It rides on the
+    payload (``demo: true``) rather than a server flag, so ``/status.json`` says the same
+    thing and the in-place refresh cannot "lose" the marker by re-rendering.
+    """
+    text = _summary_body(payload, profiles)
+    if payload.get("demo"):
+        return _pill("演示数据", "unknown") + text
+    return text
+
+
+def _summary_body(payload: Mapping[str, Any], profiles: Mapping[str, Any]) -> str:
+    """The verdict, one tile per state that occurs, then daemon facts.
 
     The counts are tiles rather than a sentence because "two of eleven" is read
     from the page's shape long before any of the words are: a zero-count tile is
@@ -1324,6 +1348,7 @@ def dashboard_html(
         title="隧道看板",
         summary=_summary(payload, profiles),
         board=board,
+        demo_note=_demo_note(payload),
     )
 
 
