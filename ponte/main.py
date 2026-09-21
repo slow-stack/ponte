@@ -17,7 +17,7 @@ import shlex
 import sys
 import time
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -44,7 +44,7 @@ from ponte.core import ProbeError
 from ponte.daemon import _format_duration
 from ponte.demo import DemoStatus
 from ponte.doctor import FAIL, OK, SKIP, WARN, counts, run_checks
-from ponte.serve import create_server, serve_url
+from ponte.serve import Provider, create_server, serve_url
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, runtime import is lazy
     from ponte.daemon import TunnelDaemon
@@ -743,7 +743,7 @@ def serve(
             raise
         except Exception as exc:
             _fail(str(exc))
-        provider: Callable[[], dict] = DemoStatus()
+        provider: Provider = DemoStatus()
     else:
         try:
             daemon = _daemon()
@@ -758,8 +758,12 @@ def serve(
         except Exception as exc:
             _fail(str(exc))
 
-        def live_status() -> dict:
-            """每次请求都重新取一次真实状态（接口本身从不缓存）。"""
+        def live_status(_query: Mapping[str, list[str]]) -> dict:
+            """每次请求都重新取一次真实状态（接口本身从不缓存）。
+
+            ``?at=`` 是演示模式的事（演示时间轴是"某个时刻的纯函数"，所以能被钉在某一刻）。
+            真实状态只有"现在"，所以这里明确忽略查询串——不是忘了处理。
+            """
             return _status_payload(daemon.status())
 
         provider = live_status

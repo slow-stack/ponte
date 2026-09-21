@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import os
+import types
 
 import pytest
 from typer.testing import CliRunner
 
 from ponte import demo
+from ponte.config import ServeConfig
 from ponte.daemon import DaemonStatus, ProfileStatus
 from ponte.main import _status_payload, app
 from ponte.serve import dashboard_html, health_response, render_metrics
@@ -179,7 +181,14 @@ def test_payload_matches_the_status_json_contract_exactly() -> None:
     assert set(real) - set(demo_payload) == set()
     assert set(demo_payload["profiles"]["web"]) == set(real["profiles"]["web"])
 
-    assert demo_payload["demo"] is True
+    # 演示时钟仍然挤在同一个键里（而不是新开一个键），所以这份比对没变松。
+    assert set(demo_payload["demo"]) == {
+        "at",
+        "anchored",
+        "next_at",
+        "next_profile",
+        "next_state",
+    }
     assert set(demo_payload["profiles"]) == {"web", "db", "metrics"}
 
 
@@ -190,7 +199,7 @@ def test_demo_data_is_labelled_in_the_payload_and_on_the_page() -> None:
     拓扑图，所以它自己得说清楚这不是。
     """
     payload = _payload(152.0)
-    assert payload["demo"] is True
+    assert payload["demo"]["anchored"] is False, "没被 ?at= 钉住时要说实话"
     assert payload["pid"] == os.getpid(), "演示的\"守护进程\"就是提供页面的这个进程"
     assert payload["running"] is True
     assert payload["uptime_seconds"] == pytest.approx(152.0)
@@ -224,6 +233,164 @@ def test_same_moment_always_renders_the_same_payload() -> None:
     provider = demo.DemoStatus(started_at=_START)
     assert provider.payload(now=_START + 152.0) == provider.payload(now=_START + 152.0)
     assert provider.payload(now=_START + 1.0) != provider.payload(now=_START + 152.0)
+
+
+# ---------------------------------------------------------------------------
+# 演示时钟：?at= 锚点与“下一处变化”
+# ---------------------------------------------------------------------------
+
+
+def _pinned(seconds: float) -> dict:
+    """``?at=`` 钉住的那一刻（页面据此要说“已固定”而不是“实时”）。"""
+    return demo.DemoStatus(started_at=_START)({"at": [str(seconds)]})
+
+
+def _visible(payload: dict) -> tuple:
+    """**看板上看得见的东西**：判定 / 结论是否确定 / 进程在不在 / 两列端口。
+
+    这里刻意不调 demo 自己的私有函数——那会把测试变成镜像（两处一起错还互不告白）。这是
+    拿渲染给用户看的那一层重算一遍。
+    """
+    return tuple(
+        (
+            name,
+            section["healthy"],
+            section["health_conclusive"],
+            section["process_alive"],
+            tuple(sorted(section["remote_ports"].items())),
+            tuple(sorted(section["local_ports"].items())),
+        )
+        for name, section in sorted(payload["profiles"].items())
+    )
+
+
+def test_the_clock_can_be_pinned_to_a_moment_by_the_query() -> None:
+    """``?at=<秒>`` 把这一刻钉在时间轴上——是**读**，不是控制端点。
+
+    锚点走查询串而不是服务端状态，这条测试把它钉住：同一个 provider 实例、同一个
+    ``?at=145``，两次调用给出同一份“断线中”的 payload，而 provider 自己没有变过。
+    """
+    provider = demo.DemoStatus(started_at=_START)
+
+    pinned = provider({"at": ["145"]})
+    assert pinned["uptime_seconds"] == pytest.approx(145.0)
+    assert pinned["demo"]["anchored"] is True
+    assert pinned["profiles"]["web"]["healthy"] is False
+    assert pinned["profiles"]["web"]["last_disconnect_reason"]
+    # 同一个锚点再问一次还是那一份：没有可变状态可以跑掉。
+    assert provider({"at": ["145"]}) == pinned
+
+    # 没有锚点就是实时，而且 ``anchored`` 如实说是 False。
+    live = provider({})
+    assert live["demo"]["anchored"] is False
+    assert live["uptime_seconds"] != pytest.approx(145.0)
+
+
+def test_the_anchor_renders_exactly_what_that_moment_renders_without_one() -> None:
+    """``?at=T`` 与 ``now=start+T`` 必须是同一份数据。
+
+    否则按钮与地址栏会各说各话：页面上的时刻与它声称的时刻不是一回事，而“一个 URL 就能
+    把看板固定在某一刻”也跟着失效。
+    """
+    provider = demo.DemoStatus(started_at=_START)
+    for seconds in (0.0, 25.0, 140.0, 146.0, 152.0, 170.0, 175.0, 210.0, 500.0):
+        pinned = provider({"at": [str(seconds)]})
+        direct = provider.payload(now=_START + seconds)
+        assert pinned["profiles"] == direct["profiles"], seconds
+        assert pinned["uptime_seconds"] == pytest.approx(direct["uptime_seconds"])
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "-1", "nan", "inf", "-inf", "1e400", "0x10", "12s"])
+def test_a_bad_anchor_falls_back_to_live_instead_of_failing(raw: str) -> None:
+    """地址栏里的锚点可能是手改的、转发的、被别的工具弄坏的，所以坏值一律回退到实时。
+
+    回退而不是报错：这是只读的演示接口，一个参数打错不该让页面白屏；而回退的方向是“显示
+    实时数据”——看板仍然完整可用，只是没被钉住。
+    """
+    payload = demo.DemoStatus(started_at=_START)({"at": [raw]})
+    assert payload["demo"]["anchored"] is False
+    assert payload["demo"]["at"] == pytest.approx(payload["uptime_seconds"], abs=0.5)
+
+
+def test_an_absurd_anchor_is_clamped() -> None:
+    """``?at=999999999`` 被钳到一天，而不是让时间轴跑到几百万个循环之外。"""
+    payload = demo.DemoStatus(started_at=_START)({"at": ["999999999"]})
+    assert payload["demo"]["anchored"] is True
+    assert payload["uptime_seconds"] == pytest.approx(demo._AT_LIMIT)
+
+
+def test_the_next_change_is_the_earliest_one_that_actually_changes_something() -> None:
+    """``next_at`` 必须是“看得见的东西变了”的最近一刻。
+
+    两件事一起验，而且都是拿**渲染给看板的那一层**重算的：
+
+    * 在 ``next_at`` 之前，任何时刻的看板都与现在一模一样——否则按钮会跳过一段真的变化；
+    * 到 ``next_at`` 那一刻，看板确实不同了——否则按钮看上去像是没反应。
+
+    ``web`` 的“断线 → 重连退避”就是必须被跳过的例子：两段的判定与两列端口完全一样。
+    """
+    provider = demo.DemoStatus(started_at=_START)
+    for seconds in (0.0, 10.0, 30.0, 120.0, 145.0, 146.0, 152.0, 170.0, 175.0, 250.0, 400.0):
+        before = _visible(provider({"at": [str(seconds)]}))
+        next_at = provider({"at": [str(seconds)]})["demo"]["next_at"]
+        assert next_at is not None and next_at > seconds, seconds
+        probe = seconds
+        while probe + 0.5 < next_at:
+            probe += 0.5
+            assert _visible(provider({"at": [str(probe)]})) == before, (seconds, probe)
+        assert _visible(provider({"at": [str(next_at)]})) != before, seconds
+
+
+def test_the_next_change_names_the_tunnel_that_changes() -> None:
+    """按钮上写着“下一处变化”，就得知道是哪条隧道变了——否则用户不知道往哪儿看。"""
+    payload = _pinned(10.0)
+    assert payload["demo"]["next_profile"] == "db"
+    assert payload["demo"]["next_state"] == demo.DISCONNECTED
+    assert payload["demo"]["next_at"] == pytest.approx(25.0)
+
+
+def test_the_page_offers_the_clock_only_for_demo_data() -> None:
+    """控制条只在演示模式出现，而且“下一处变化”是服务端算的（它才知道时间轴）。
+
+    同时钉住一件事：**读数是纯文本**，所以关掉脚本的页面仍然说得出自己停在哪一刻；而按钮
+    与它背后的脚本一起出现（一个按下去没反应的控件比没有控件更糟）。
+    """
+    pinned = dashboard_html(_pinned(145.0), refresh=5, now=_START + 145.0)
+    assert 'id="democtl"' in pinned
+    assert 'data-at="145.0"' in pinned
+    assert 'data-anchored="1"' in pinned
+    assert 'data-next-at="164.0"' in pinned
+    assert 'data-next-profile="web"' in pinned, "按钮要说清是哪条隧道要变（看板上有三行）"
+    assert "web" in pinned.split("下一处变化")[1][:40]
+    assert "已固定" in pinned
+    assert "0h 2m 25s" in pinned, "读数得是给人看的时长"
+    assert 'id="demobuttons" hidden' in pinned, "按钮先藏着，等驱动它们的脚本起来"
+    # 锚点也跟着进页脚的链接，否则看板钉在某一刻、status.json 却回答"现在"。
+    assert 'href="/status.json?at=145.0"' in pinned
+
+    # 实时（没被钉住）时不该在链接上塞 at，也不该说"已固定"。
+    live = dashboard_html(_payload(10.0), refresh=5, now=_START + 10.0)
+    assert 'id="democtl"' in live
+    assert "实时" in live
+    assert 'href="/status.json"' in live
+    assert 'href="/status.json?at=' not in live
+    assert 'href="/metrics?at=' not in live
+
+    # 真实数据里根本没有这整个东西。
+    real = _status_payload(
+        DaemonStatus(
+            running=True,
+            pid=4242,
+            started_at=_START,
+            uptime_seconds=3600.0,
+            profiles=[ProfileStatus(name="web", destination="deploy@edge.example.com:22")],
+        )
+    )
+    real_html = dashboard_html(real, refresh=5, now=_START + 3600.0)
+    # 样式表是所有页面共用的，所以查**标记**而不是类名。
+    assert 'id="democtl"' not in real_html
+    assert "演示时钟" not in real_html
+    assert "演示数据" not in real_html
 
 
 # ---------------------------------------------------------------------------
@@ -271,8 +438,8 @@ def test_demo_mode_needs_no_config_and_never_touches_the_daemon(monkeypatch) -> 
         "token": "",
         "refresh": 5,
     }
-    payload = captured["provider"]()
-    assert payload["demo"] is True
+    payload = captured["provider"]({})
+    assert payload["demo"]["anchored"] is False
     assert set(payload["profiles"]) == {"web", "db", "metrics"}
 
 
@@ -285,3 +452,48 @@ def test_demo_mode_still_refuses_to_expose_the_dashboard_without_a_token(monkeyp
     result = CliRunner().invoke(app, ["serve", "--demo", "--host", "0.0.0.0"])
     assert result.exit_code != 0
     assert "令牌" in result.output
+
+
+def test_live_mode_ignores_the_demo_anchor(monkeypatch) -> None:
+    """``?at=`` 只属于演示模式：真实状态只有“现在”，非演示模式下它必须什么都不做。
+
+    这条钉的是一个**不该开的后门**。如果实时路径也认这个参数，那么任何能访问到这个端口
+    的人（或者一个把地址栏填好的链接）就能让看板显示一个“过去/未来的”状态——而真实状态
+    根本没有其它时刻可言，时间轴只存在于演示数据里。
+    """
+
+    class _Daemon:
+        config = types.SimpleNamespace(serve=ServeConfig())
+
+        def status(self) -> DaemonStatus:
+            return DaemonStatus(
+                running=True,
+                pid=4242,
+                started_at=_START,
+                uptime_seconds=42.0,
+                profiles=[
+                    ProfileStatus(name="web", destination="deploy@edge.example.com:22")
+                ],
+            )
+
+    monkeypatch.setattr("ponte.main._daemon", _Daemon)
+    captured: dict = {}
+
+    class _Server:
+        def serve_forever(self, poll_interval: float = 0.5) -> None:
+            raise KeyboardInterrupt
+
+        def server_close(self) -> None:
+            pass
+
+    def fake_create_server(provider, **kwargs):
+        captured["provider"] = provider
+        return _Server()
+
+    monkeypatch.setattr("ponte.main.create_server", fake_create_server)
+    result = CliRunner().invoke(app, ["serve", "--port", "8792"])
+    assert result.exit_code == 0, result.output
+
+    payload = captured["provider"]({"at": ["999"]})
+    assert "demo" not in payload
+    assert payload["uptime_seconds"] == pytest.approx(42.0), "实时状态不许被锚点挪动"

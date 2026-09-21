@@ -685,7 +685,7 @@ def test_request_lines_cannot_forge_log_lines(caplog) -> None:
     """
     hostile = b"GET /x\x1b[31mFORGED\x00\x7f\xc2\x80 HTTP/1.1"
     with caplog.at_level(logging.DEBUG, logger="ponte.serve"):
-        with _running_server(lambda: _payload()) as base:
+        with _running_server(lambda _query: _payload()) as base:
             _raw_request(base, hostile)
 
     logged = [record.getMessage() for record in caplog.records if record.name == "ponte.serve"]
@@ -695,7 +695,7 @@ def test_request_lines_cannot_forge_log_lines(caplog) -> None:
 
 
 def test_end_to_end_endpoints_answer() -> None:
-    with _running_server(lambda: _payload()) as base:
+    with _running_server(lambda _query: _payload()) as base:
         status, headers, body = _get(base + "/")
         assert status == 200
         assert headers["Content-Type"].startswith("text/html")
@@ -718,7 +718,7 @@ def test_end_to_end_endpoints_answer() -> None:
 def test_end_to_end_healthz_tracks_the_tunnel() -> None:
     """The probe reports the tunnel, not the process: 503 when it breaks."""
     state = {"payload": _payload()}
-    with _running_server(lambda: state["payload"]) as base:
+    with _running_server(lambda _query: state["payload"]) as base:
         assert _get(base + "/healthz")[0] == 200
         state["payload"] = _payload(
             profiles={"web": _profile(healthy=False, health_error="port closed")}
@@ -731,7 +731,7 @@ def test_end_to_end_healthz_tracks_the_tunnel() -> None:
 def test_end_to_end_status_is_never_cached() -> None:
     """A replayed "healthy" page is the exact failure the endpoint prevents."""
     state = {"payload": _payload()}
-    with _running_server(lambda: state["payload"]) as base:
+    with _running_server(lambda _query: state["payload"]) as base:
         _, headers, _ = _get(base + "/")
         assert headers["Cache-Control"] == "no-store"
         state["payload"] = {"running": False}
@@ -739,7 +739,7 @@ def test_end_to_end_status_is_never_cached() -> None:
 
 
 def test_end_to_end_unknown_path_and_method() -> None:
-    with _running_server(lambda: _payload()) as base:
+    with _running_server(lambda _query: _payload()) as base:
         status, _, body = _get(base + "/nope")
         assert status == 404
         assert "/metrics" in json.loads(body)["endpoints"]
@@ -751,7 +751,7 @@ def test_end_to_end_unknown_path_and_method() -> None:
 
 
 def test_end_to_end_head_sends_headers_without_a_body() -> None:
-    with _running_server(lambda: _payload()) as base:
+    with _running_server(lambda _query: _payload()) as base:
         status, headers, body = _get(base + "/metrics", method="HEAD")
         assert status == 200
         assert int(headers["Content-Length"]) > 0
@@ -760,7 +760,7 @@ def test_end_to_end_head_sends_headers_without_a_body() -> None:
 
 def test_end_to_end_token_gate() -> None:
     """With a token set, nothing is served without it — header or query."""
-    with _running_server(lambda: _payload(), token="s3cret") as base:
+    with _running_server(lambda _query: _payload(), token="s3cret") as base:
         for path in _ROUTES_FOR_TOKEN_TEST:
             status, headers, _ = _get(base + path)
             assert status == 401, path
@@ -792,7 +792,7 @@ def test_end_to_end_provider_failure_answers_500_without_dropping_the_client() -
 def test_serve_refuses_to_expose_without_a_token() -> None:
     """Refusing beats warning: the page maps your infrastructure."""
     with pytest.raises(ConfigValidationError) as caught:
-        create_server(lambda: _payload(), host="0.0.0.0", port=0)
+        create_server(lambda _query: _payload(), host="0.0.0.0", port=0)
     assert "token" in str(caught.value)
 
 
@@ -810,13 +810,35 @@ def test_serve_allows_a_non_loopback_bind_when_a_token_is_set() -> None:
 
 def test_create_server_carries_its_settings() -> None:
     server = create_server(
-        lambda: _payload(), host="127.0.0.1", port=0, token="s3cret", refresh=9
+        lambda _query: _payload(), host="127.0.0.1", port=0, token="s3cret", refresh=9
     )
     try:
         assert server.token == "s3cret"
         assert server.refresh == 9
     finally:
         server.server_close()
+
+
+def test_the_provider_sees_this_request_s_query() -> None:
+    """provider 拿到的是**这一次请求**的查询串（演示时钟的锚点走的就是这条路）。
+
+    值得单独钉住，因为这不只是个实现细节：``ponte serve --demo`` 靠它把时间轴钉在
+    ``?at=`` 上，而那就是“服务端不必持有可变状态”的前提。哪天这层接线被静默改掉，演示
+    时钟会退化成“按钮不起作用”，而其它测试全是绿的。
+    """
+    seen: list[dict[str, list[str]]] = []
+
+    def provider(query):
+        seen.append({key: list(value) for key, value in query.items()})
+        return _payload()
+
+    with _running_server(provider) as base:
+        status, _, _ = _get(f"{base}/status.json?at=145&token=x")
+        assert status == 200
+
+    assert seen, "provider 应该被调用过"
+    assert seen[-1].get("at") == ["145"]
+    assert seen[-1].get("token") == ["x"]
 
 
 @pytest.mark.parametrize(

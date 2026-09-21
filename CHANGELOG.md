@@ -213,6 +213,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not be mistakable for somebody's real infrastructure. Sample hosts are
   `example.com`. The bind rules are unchanged: a non-loopback `--host` still
   demands a token.
+- **The demo timeline can be pinned, stepped and frozen from the page.** Waiting
+  out a 140-second healthy stretch to reach the interesting state is a poor way to
+  look at a dashboard, and a demo that only moves on its own clock is one you
+  watch rather than use. `ponte serve --demo` now marks the moment it is showing
+  in the footer and offers `冻结` / `−10s` / `+10s` / `下一处变化` / `回到现在`
+  beside it. `下一处变化` jumps to the **next change that is visible on the
+  board**, not to the next phase boundary: a tunnel that moves from
+  "disconnected" to "retrying" renders identically (same verdict, same ports), so
+  a button that lands where nothing changed reads as broken — those boundaries are
+  skipped, which is asserted by re-deriving the board's visible state from the
+  rendered payload at every half-second up to the target. Freezing stops the
+  reading advancing *while the page keeps refreshing*, so a frozen board is
+  visibly frozen instead of being indistinguishable from a dead tab (the `已更新`
+  ticker keeps moving). Stepping while frozen deliberately stays frozen — walking
+  a fault state by state is the point. All of it is a **read**: the moment rides a
+  `?at=<seconds>` query and the server still holds no mutable state, which is why
+  a live `ponte serve` ignores the parameter entirely (`?at=abc`, negatives,
+  infinities and absurd values fall back to live, clamped at a day), why the four
+  endpoints stay idempotent, why two viewers of one URL see the same board, and
+  why a copied link reproduces the exact moment it was copied from. The footer's
+  `status.json` / `metrics` / `healthz` links carry the anchor with them, so a
+  pinned page does not hand out a JSON of *now*. To keep it a read the status
+  provider now receives the request's query (`ponte.serve.Provider`); the live
+  provider ignores it. The demo marker grew from `"demo": true` into
+  `"demo": {"at": …, "anchored": …, "next_at": …, "next_profile": …}` — still
+  the one extra key in `/status.json`, but the clock now travels with the data the
+  page renders, so the buttons cannot act on a stale moment.
 - **The jump chain is part of the status, next to the destination.**
   `ProfileStatus.jump` carries the `ssh -J` value, so `ponte status --json` and
   the dashboard can tell "cannot reach the server" apart from "cannot reach the

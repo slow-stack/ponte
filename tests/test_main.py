@@ -817,7 +817,7 @@ def test_serve_command_serves_and_stops_cleanly(monkeypatch) -> None:
     assert record["server"].closed is True
     assert record["server"].kwargs["port"] == 9100
     # provider 必须现读现取：看板的“新鲜度”全靠它，缓存一次就失去意义。
-    payload = record["provider"]()
+    payload = record["provider"]({})
     assert payload["profiles"]["default"]["healthy"] is True
 
 

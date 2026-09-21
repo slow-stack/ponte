@@ -19,6 +19,11 @@ payload 契约漂移而悄悄失真，而它长得和真数据一模一样，最
 ===================  ==========================================================
 
 用法：``ponte serve --demo``（见 ``ponte.main.serve``）。
+
+时间轴可以被**钉在某一刻**：``?at=<秒>``（相对启动）。锚点是**读**而不是写——时间轴本来
+就是"某个时刻的纯函数"，所以让那个时刻从请求里来，服务端不必持有任何可变状态；去掉这个
+参数就回到实时。于是一个 URL 就能把看板固定在某一刻，截图里自帯"这是哪一刻"，而页面上的
+按钮只是会改地址栏里那个数字的便利层。
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +43,9 @@ UNKNOWN = "unknown"
 
 #: 事件流保留多少条（与看板的 ``_FEED_LIMIT`` 对齐；多几条无妨，看板会自己截断）。
 _FEED_LIMIT = 8
+
+#: ``?at=`` 的上限：一天。更远的锚点没有意义，也顺手挡住离谱输入。
+_AT_LIMIT = 86_400.0
 
 #: 这些状态下 SSH 会话还活着——可用率因此把它们算成"在线"。
 _ALIVE_STATES = frozenset({CONNECTED, UNKNOWN})
@@ -139,6 +148,24 @@ _PROFILES: tuple[DemoProfile, ...] = (
 
 def _is_up(state: str) -> bool:
     return state in _ALIVE_STATES
+
+
+def _parse_at(query: Mapping[str, list[str]] | None) -> float | None:
+    """读 ``?at=`` 锚点：一个非负的有限秒数，否则 ``None``（跟随墙上时钟）。
+
+    坏值一律回退到实时而不报错：这是只读的演示接口，打错一个参数不该让页面挂掉（尤其因为
+    地址栏里那个参数是按钮写上去的，刷新、手改、转发都可能弄出奇怪的值）。
+    """
+    values = (query or {}).get("at")
+    if not values:
+        return None
+    try:
+        at = float(values[0].strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not math.isfinite(at) or at < 0:
+        return None
+    return min(at, _AT_LIMIT)
 
 
 def _phase_starts(profile: DemoProfile) -> list[float]:
@@ -317,6 +344,57 @@ def _profile_payload(profile: DemoProfile, *, started: float, now: float) -> dic
     }
 
 
+def _visible_state(profile: DemoProfile, index: int) -> tuple[Any, ...]:
+    """看板在一段里渲染出来的"状态"：判定、结论是否确定、进程在不在、两列端口。
+
+    这是"**有没有变化**"的判据——它跟着看板走，而不是跟着阶段走（见 :func:`_next_change`）。
+    """
+    phase = profile.phases[index]
+    return (
+        phase.state == CONNECTED and not phase.reason,
+        phase.state != UNKNOWN,
+        _is_up(phase.state),
+        tuple(_port_state(phase, remote=True) for _ in profile.remote_ports),
+        tuple(_port_state(phase, remote=False) for _ in profile.local_ports),
+    )
+
+
+def _next_change(profile: DemoProfile, elapsed: float) -> tuple[float, int] | None:
+    """``elapsed`` 之后，这条隧道下一次可见的变化：(虚拟秒, 循环内第几段)。
+
+    判据是"看板上看得见的东西变了没有"，而不是"进入下一段"。理由具体：像 ``web`` 的
+    "断线 → 重连退避"那两段，判定、两列端口完全一样（页面上的字也几乎一样），中间那个边界
+    跳过去等于按钮失灵。所以拿 :func:`_visible_state` 比，跳过那些看不出来的边界。
+
+    周期是有限的，所以变化一定在"当前这一轮剩下的边界 + 下一轮"里，不需要无界搜索。
+    """
+    cycle = profile.cycle_seconds
+    starts = _phase_starts(profile)
+    current = _visible_state(profile, _locate(profile, elapsed % cycle))
+    base = int(elapsed // cycle)
+    for cycle_index in (base, base + 1):
+        for index, start in enumerate(starts):
+            when = cycle_index * cycle + start
+            if when <= elapsed:
+                continue
+            if _visible_state(profile, index) != current:
+                return when, index
+    return None  # pragma: no cover - 三个演示 profile 每一轮都会变
+
+
+def _next_change_at(elapsed: float) -> tuple[float, str, str] | None:
+    """全部 profile 里最近的一次可见变化：(虚拟秒, 哪条隧道, 变成什么状态)。"""
+    best: tuple[float, str, str] | None = None
+    for profile in _PROFILES:
+        found = _next_change(profile, elapsed)
+        if found is None:  # pragma: no cover - 见 _next_change
+            continue
+        when, index = found
+        if best is None or when < best[0]:
+            best = (when, profile.name, profile.phases[index].state)
+    return best
+
+
 def _port_state(phase: Phase, *, remote: bool) -> bool:
     """端口在某一刻的样子。
 
@@ -343,8 +421,14 @@ class DemoStatus:
         #: 演示的"守护进程"就是提供看板的这个进程，pid 因此是真的。
         self.pid = os.getpid()
 
-    def payload(self, *, now: float | None = None) -> dict[str, Any]:
-        """某一刻的完整 payload（``now`` 可注入，便于测试钉住时刻）。"""
+    def payload(
+        self, *, now: float | None = None, anchored: bool = False
+    ) -> dict[str, Any]:
+        """某一刻的完整 payload（``now`` 可注入，便于测试钉住时刻）。
+
+        ``anchored`` 只描述"这一刻是怎么来的"（``?at=`` 钉住的，还是墙上时钟），供页面把
+        时钟标的诚实（"已固定" / "实时"）；它不影响任何一个数据字段。
+        """
         moment = time.time() if now is None else now
         profiles: dict[str, dict[str, Any]] = {}
         for profile in _PROFILES:
@@ -355,15 +439,30 @@ class DemoStatus:
                 section["local_ports"] = {}
             profiles[profile.name] = section
         healthy = all(section["healthy"] for section in profiles.values())
+        elapsed = max(0.0, moment - self.started_at)
+        upcoming = _next_change_at(elapsed)
         return {
             "running": True,
             "pid": self.pid,
             "started_at": self.started_at,
-            "uptime_seconds": max(0.0, moment - self.started_at),
+            "uptime_seconds": elapsed,
             "healthy": healthy,
-            "demo": True,
+            # 一个对象而不是 ``true``：标记与"当前停在哪一刻、下一次变化在哪"是同一件事——
+            # 都是演示特有的，而且都必须与看板同时到达客户端（否则按钮会基于过期的时刻跳）。
+            # 它仍然是 payload 里唯一多出来的键，契约测试因此没变松。
+            "demo": {
+                "at": round(elapsed, 1),
+                "anchored": anchored,
+                "next_at": round(upcoming[0], 1) if upcoming else None,
+                "next_profile": upcoming[1] if upcoming else None,
+                "next_state": upcoming[2] if upcoming else None,
+            },
             "profiles": profiles,
         }
 
-    def __call__(self) -> dict[str, Any]:
-        return self.payload()
+    def __call__(self, query: Mapping[str, list[str]] | None = None) -> dict[str, Any]:
+        """``ponte serve`` 每次请求都调这个；``?at=`` 把这一刻钉在时间轴的任意位置。"""
+        at = _parse_at(query)
+        if at is None:
+            return self.payload(anchored=False)
+        return self.payload(now=self.started_at + at, anchored=True)
