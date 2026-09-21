@@ -17,6 +17,7 @@ import shlex
 import sys
 import time
 import webbrowser
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -41,6 +42,7 @@ from ponte.config import (
 )
 from ponte.core import ProbeError
 from ponte.daemon import _format_duration
+from ponte.demo import DemoStatus
 from ponte.doctor import FAIL, OK, SKIP, WARN, counts, run_checks
 from ponte.serve import create_server, serve_url
 
@@ -720,24 +722,51 @@ def serve(
         None, "--refresh", min=1, help="看板自动刷新间隔（秒）"
     ),
     open_browser: bool = typer.Option(False, "--open", help="启动后在浏览器里打开看板"),
+    demo: bool = typer.Option(
+        False,
+        "--demo",
+        help="用内置的示例数据启动（不读配置、不看守护进程）；页面与 payload 会标明是演示数据",
+    ),
 ) -> None:
     """启动本地 HTTP 服务：看板 / 、探活 /healthz、指标 /metrics、快照 /status.json。"""
-    try:
-        daemon = _daemon()
-        effective = _serve_config(
-            daemon.config.serve, host=host, port=port, token=token, refresh=refresh
-        )
-        # 与配置文件走同一条校验：绑定非回环地址却没有令牌时直接拒绝，
-        # 不提供“先跑起来再说”的选项。
-        effective.check_bind()
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        _fail(str(exc))
+    if demo:
+        # 演示模式刻意不碰配置、也不碰守护进程：还没有隧道的人（或者不想为了看一眼页面
+        # 去连真服务器的人）也该能看见这个页面长什么样。数据是内置的，而且在页面、
+        # payload 与下面这行输出里都标明它是演示数据（见 ``ponte.demo``）。
+        try:
+            effective = _serve_config(
+                ServeConfig(), host=host, port=port, token=token, refresh=refresh
+            )
+            # 绑定校验照旧：演示数据看起来仍然像一张内网拓扑图，暴露到网上一样危险。
+            effective.check_bind()
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            _fail(str(exc))
+        provider: Callable[[], dict] = DemoStatus()
+    else:
+        try:
+            daemon = _daemon()
+            effective = _serve_config(
+                daemon.config.serve, host=host, port=port, token=token, refresh=refresh
+            )
+            # 与配置文件走同一条校验：绑定非回环地址却没有令牌时直接拒绝，
+            # 不提供“先跑起来再说”的选项。
+            effective.check_bind()
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            _fail(str(exc))
+
+        def live_status() -> dict:
+            """每次请求都重新取一次真实状态（接口本身从不缓存）。"""
+            return _status_payload(daemon.status())
+
+        provider = live_status
 
     try:
         server = create_server(
-            lambda: _status_payload(daemon.status()),
+            provider,
             host=effective.host,
             port=effective.port,
             token=effective.token,
@@ -750,6 +779,10 @@ def serve(
         )
 
     url = serve_url(effective.host, effective.port)
+    if demo:
+        console.print(
+            "[yellow]演示模式：看板展示的是内置示例数据（example.com），不是你的隧道[/yellow]"
+        )
     console.print(f"[green]ponte 看板已启动：{url}[/green]")
     console.print(
         f"[dim]指标 {url}metrics · 探活 {url}healthz · 快照 {url}status.json[/dim]"

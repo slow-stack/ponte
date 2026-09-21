@@ -120,7 +120,7 @@ import package stay `ponte`; a checkout installs the same way (`pipx install .`)
 | `check [--profile NAME]` | verify tunnel ports are listening (`-R` on the server, `-L`/`-D` locally) |
 | `doctor [--offline] [--timeout S] [--json]` | one-shot checkup of config, key, connectivity, ports, auto-start and notifications, each row with a fix (`--json` for scripts) |
 | `notify-test [--profile NAME]` | send a test alert through the configured ntfy / webhook channels |
-| `serve [--host H] [--port P] [--token T] [--open]` | local HTTP dashboard, `/healthz` probe, Prometheus `/metrics`, `/status.json` snapshot |
+| `serve [--host H] [--port P] [--token T] [--open] [--demo]` | local HTTP dashboard, `/healthz` probe, Prometheus `/metrics`, `/status.json` snapshot; `--demo` serves built-in sample data |
 | `install` / `uninstall` | register / remove the OS auto-start service |
 | `config [--ssh-command]` | print the effective configuration, its source file and any warnings (`--ssh-command` prints the exact `ssh` argv) |
 
@@ -139,6 +139,14 @@ everything else — a browser, a phone on the same host, Uptime Kuma, Prometheus
 ponte serve            # http://127.0.0.1:8787/  (loopback only by default)
 ponte serve --open     # ...and open it in your browser
 ```
+
+**No tunnels yet?** `ponte serve --demo` runs the same server on built-in sample
+data: a small timeline that connects, drops, backs off and reconnects on its own,
+so the page shows every state it has — healthy, broken, and *unknown* (a probe
+that could not answer). It reads no config and never touches a daemon, and the
+payload (`"demo": true`), the page header and the CLI output all say the data is
+a demo: a dashboard screenshot names your servers, so it must not be mistakable
+for somebody's real infrastructure. Sample hosts use `example.com`.
 
 | Endpoint | What it answers |
 |----------|-----------------|
@@ -441,7 +449,7 @@ ponte install           # 注册开机自启 + 崩溃重启
 | `check [--profile NAME]` | 检查隧道端口（`-R` 在服务器上，`-L`/`-D` 在本机） |
 | `doctor [--offline] [--timeout S] [--json]` | 一键体检配置、密钥、连通性、端口、自启与通知，每项给出修法（`--json` 供脚本消费） |
 | `notify-test [--profile NAME]` | 通过已配置的 ntfy / webhook 通道发一条测试通知 |
-| `serve [--host H] [--port P] [--token T] [--open]` | 本地 HTTP 看板、`/healthz` 探活、Prometheus `/metrics`、`/status.json` 快照 |
+| `serve [--host H] [--port P] [--token T] [--open] [--demo]` | 本地 HTTP 看板、`/healthz` 探活、Prometheus `/metrics`、`/status.json` 快照；`--demo` 用内置示例数据 |
 | `install` / `uninstall` | 注册 / 移除开机自启服务 |
 | `config [--ssh-command]` | 打印生效配置、来源文件与配置告警（`--ssh-command` 打印实际执行的 ssh 命令） |
 
@@ -459,6 +467,12 @@ ponte install           # 注册开机自启 + 崩溃重启
 ponte serve            # http://127.0.0.1:8787/（默认只监听本机）
 ponte serve --open     # 顺手在浏览器里打开
 ```
+
+**还没有隧道？** `ponte serve --demo` 用内置的示例数据把同一个服务跑起来：一份自己会
+连接、断线、退避、重连的小时间轴，于是页面上该有的状态都会出现——健康、异常，以及
+**未知**（探针没能得出结论）。它不读配置、也不碰守护进程；payload（`"demo": true`）、
+页面头部与命令行输出三处都写明这是演示数据：看板截图里写着服务器地址与端口，它不该被
+误读成某个人的真实基础设施。示例主机名一律用 `example.com`。
 
 | 接口 | 回答什么问题 |
 |------|--------------|
