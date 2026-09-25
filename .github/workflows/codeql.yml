@@ -34,7 +34,7 @@ jobs:
         language: ["python"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 使用默认查询集（GitHub 模板的默认值）。security-and-quality 会带进质量类
       # 告警，而 ruleset 的 alerts_threshold 是 errors —— 一条质量告警就会卡住
