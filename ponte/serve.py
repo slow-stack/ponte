@@ -29,7 +29,10 @@ Three rules shape the implementation:
 * **Read-only, and always fresh.** Every request re-reads the daemon status, so
   a page can never show a cached "healthy" for a tunnel that has since died.
   Nothing here can start, stop or reconfigure anything — the worst a leaked
-  token buys is a read of your port numbers.
+  token buys is a read of your port numbers. Even the demo clock obeys this: it
+  is pinned with a ``?at=`` query (see :mod:`ponte.demo`) rather than by poking
+  the server into a mode, so there is no state to race with, no non-idempotent
+  endpoint to guard, and two viewers of the same URL see the same board.
 
 The one thing this module deliberately does *not* do is invent numbers: the
 dashboard, the JSON, the health probe and the metrics are all rendered from the
@@ -57,6 +60,7 @@ from ponte.daemon import _format_duration
 
 __all__ = [
     "PonteHTTPServer",
+    "Provider",
     "create_server",
     "dashboard_html",
     "health_response",
@@ -65,6 +69,16 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+#: A status provider: one request's query string in, the payload to render out.
+#:
+#: The query is part of the contract because ``ponte serve --demo`` pins its
+#: timeline with ``?at=`` (:mod:`ponte.demo`). Handing the provider the request is
+#: what keeps that a *read* — the alternative, a control endpoint that mutates a
+#: clock, would put the first piece of mutable state, and the first
+#: non-idempotent route, into a server whose whole posture is "nothing here can
+#: change anything". A live daemon simply ignores the argument.
+Provider = Callable[[Mapping[str, list[str]]], dict[str, Any]]
 
 #: How many recent retry-loop events a dashboard card shows.
 _FEED_LIMIT = 8
@@ -753,6 +767,16 @@ button.pause {
   cursor: pointer;
 }
 button.pause:hover { color: var(--text); border-color: var(--accent); }
+/* The demo clock (`ponte serve --demo`). The reading is plain text so it works
+   without scripting; the buttons are hidden until the script that drives them
+   is running, because a dead control is worse than no control. */
+.democtl { display: inline-flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; }
+.democtl b { color: var(--dim); font-weight: 600; font-variant-numeric: tabular-nums; }
+/* Frozen is a *state*, so it is coloured instead of only worded: a screenshot
+   of a paused clock should say so without anyone reading the label. */
+.democtl.frozen b { color: var(--unk); }
+#demobuttons { display: inline-flex; gap: 6px; }
+#demobuttons[hidden] { display: none; }
 .muted { color: var(--faint); }
 /* Narrow screens: stack the row instead of scrolling sideways. */
 @media (max-width: 760px) {
@@ -783,11 +807,11 @@ button.pause:hover { color: var(--text); border-color: var(--accent); }
 <main id="board">$board</main>
 <footer>
   <span class="live" id="live">每 $refresh 秒自动刷新（无脚本时整页刷新）</span>
-  <button class="pause" id="pauser" type="button" hidden>暂停</button>$demo_note
+  <button class="pause" id="pauser" type="button" hidden>暂停</button>$demo_controls$demo_note
   <span class="links">数据来自 ponte status 的同一份状态，点任意一行看明细 ·
-  <a href="/status.json">status.json</a> ·
-  <a href="/metrics">metrics</a> ·
-  <a href="/healthz">healthz</a></span>
+  <a href="/status.json$at_query">status.json</a> ·
+  <a href="/metrics$at_query">metrics</a> ·
+  <a href="/healthz$at_query">healthz</a></span>
 </footer>
 <script>
 /* Progressive enhancement, in one place and one direction: everything above is
@@ -809,6 +833,11 @@ button.pause:hover { color: var(--text); border-color: var(--accent); }
   var timer = null;
   var failures = 0;
   var paused = false;
+  var demoCtl = document.getElementById('democtl');
+  var demoButtons = document.getElementById('demobuttons');
+  var demoRead = document.getElementById('demoat');
+  var demoState = document.getElementById('demostate');
+  var demoFreeze = document.getElementById('demofreeze');
 
   function clock() {
     function pad(value) { return (value < 10 ? '0' : '') + value; }
@@ -858,8 +887,85 @@ button.pause:hover { color: var(--text); border-color: var(--accent); }
     if (timer === null) { timer = window.setInterval(refresh, every); }
   }
 
+  /* ---------------------------------------------------------------------
+     The demo clock.
+
+     A demo payload is a pure function of "how long since the server started",
+     so the only thing this page has to do is keep that number moving and put
+     it in the URL — the server then renders that same moment for anyone who
+     opens the same link. Freezing is therefore not a server state to race
+     with: it is simply this page no longer advancing the number. With no
+     `at=` in the URL the server follows the wall clock and none of this runs.
+     --------------------------------------------------------------------- */
+  var elapsed = 0;   // seconds since the server started, as this page counts them
+  var anchor = null; // null = follow the clock; a number = pinned to that moment
+  var frozen = false;
+  var ticked = 0;
+
+  function human(seconds) {
+    var whole = Math.max(0, Math.floor(seconds));
+    var hours = Math.floor(whole / 3600);
+    var minutes = Math.floor((whole % 3600) / 60);
+    return hours + 'h ' + minutes + 'm ' + (whole % 60) + 's';
+  }
+
+  /* The next visible change is the server's to know: it owns the timeline. It
+     rides along on the rendered control, so it is refreshed with the board. */
+  function demoNext() {
+    var value = demoCtl ? parseFloat(demoCtl.getAttribute('data-next-at')) : NaN;
+    return isFinite(value) ? value : null;
+  }
+
+  function url() {
+    var params = new URLSearchParams(window.location.search);
+    if (anchor === null) {
+      /* Back to live: drop the anchor entirely rather than pinning "now". */
+      if (!params.has('at')) { return window.location.pathname + window.location.search; }
+      params.delete('at');
+    } else {
+      params.set('at', anchor.toFixed(1));
+    }
+    var query = params.toString();
+    return window.location.pathname + (query ? '?' + query : '');
+  }
+
+  function advance() {
+    var now = Date.now();
+    var step = ticked ? (now - ticked) / 1000 : 0;
+    elapsed += step;
+    /* While frozen the reading stays put — including across a tab left hidden,
+       which is the one place a frozen value would otherwise creep forward. */
+    if (anchor !== null && !frozen) { anchor += step; }
+    ticked = now;
+  }
+
+  function paint() {
+    if (!demoCtl) { return; }
+    var moment = (anchor === null ? elapsed : anchor);
+    var who = demoCtl.getAttribute('data-next-profile') || '';
+    demoCtl.className = 'democtl' + (frozen ? ' frozen' : '');
+    if (demoRead) { demoRead.textContent = human(moment); }
+    if (demoState) {
+      var target = demoNext();
+      var tail = target === null ? '' : ' · 下一处变化 ' + (who ? who + ' ' : '') + human(target - moment) + '后';
+      if (target !== null && target < moment) {
+        tail = ' · 已经越过下一处变化';
+      }
+      demoState.textContent = '（' + (frozen ? '已冻结' : (anchor === null ? '实时' : '已固定')) + tail + '）';
+    }
+    if (demoFreeze) { demoFreeze.textContent = frozen ? '继续' : '冻结'; }
+  }
+
   function refresh() {
-    fetch(window.location.pathname + window.location.search, {cache: 'no-store'})
+    advance();
+    paint();
+    var target = url();
+    if (target !== window.location.pathname + window.location.search) {
+      /* The address bar is the anchor, so it has to say what we are asking for
+         — a link copied mid-flight therefore reproduces this exact moment. */
+      window.history.replaceState(null, '', target);
+    }
+    fetch(target, {cache: 'no-store'})
       .then(function (response) {
         if (response.ok) { return response.text(); }
         if (response.status === 401 || response.status === 403) { throw 'auth'; }
@@ -874,6 +980,14 @@ button.pause:hover { color: var(--text); border-color: var(--accent); }
         board.innerHTML = nextBoard.innerHTML;
         summary.innerHTML = nextSummary.innerHTML;
         restore(before);
+        var nextDemo = next.getElementById('democtl');
+        if (demoCtl && nextDemo) {
+          demoCtl.setAttribute('data-at', nextDemo.getAttribute('data-at'));
+          demoCtl.setAttribute('data-anchored', nextDemo.getAttribute('data-anchored'));
+          demoCtl.setAttribute('data-next-at', nextDemo.getAttribute('data-next-at'));
+          demoCtl.setAttribute('data-next-profile', nextDemo.getAttribute('data-next-profile'));
+          paint();
+        }
         failures = 0;
         say('ok', '已更新 ' + clock() + ' · 每 $refresh 秒');
       })
@@ -900,6 +1014,56 @@ button.pause:hover { color: var(--text); border-color: var(--accent); }
         halt();
         say('', '已暂停自动刷新，点“继续”恢复');
       }
+    });
+  }
+  if (demoCtl) {
+    var rendered = parseFloat(demoCtl.getAttribute('data-at'));
+    elapsed = isFinite(rendered) ? rendered : 0;
+    if (demoCtl.getAttribute('data-anchored') === '1') { anchor = elapsed; }
+    ticked = Date.now();
+    paint();
+  }
+  /* The buttons are revealed here rather than in the markup: they only exist
+     once the code behind them does. */
+  if (demoCtl && demoButtons) {
+    demoButtons.hidden = false;
+    function pin(seconds) {
+      if (anchor === null) { anchor = elapsed; }  // 从"现在"起跳
+      anchor = Math.max(0, anchor + seconds);
+      ticked = Date.now();
+      refresh();
+    }
+    function wire(id, handler) {
+      var node = document.getElementById(id);
+      if (node) { node.addEventListener('click', handler); }
+    }
+    if (demoFreeze) {
+      demoFreeze.addEventListener('click', function () {
+        /* Deliberately does not move the anchor: freezing is "stop advancing",
+           so resuming continues from exactly where it stopped. Stepping while
+           frozen is the useful way to walk a fault state by state, so the step
+           buttons leave this alone. */
+        frozen = !frozen;
+        ticked = Date.now();
+        refresh();
+      });
+    }
+    wire('demoback', function () { pin(-10); });
+    wire('demofwd', function () { pin(10); });
+    wire('demonext', function () {
+      var target = demoNext();
+      if (target === null) { return; }
+      /* Just past the boundary, so what renders is the state *after* the
+         change — landing on it exactly would depend on float exactness. */
+      anchor = target + 0.05;
+      ticked = Date.now();
+      refresh();
+    });
+    wire('demolive', function () {
+      anchor = null;
+      frozen = false;
+      ticked = Date.now();
+      refresh();
     });
   }
   /* No point polling a tab nobody is looking at. */
@@ -1073,6 +1237,81 @@ def _feed(section: Mapping[str, Any]) -> str:
             f'<span class="i {tone}">{_esc(glyph)}</span>{_esc(detail)}</div>'
         )
     return "".join(lines)
+
+
+def _demo_clock(payload: Mapping[str, Any]) -> tuple[float, bool, float | None, str] | None:
+    """Read the demo clock out of a payload: (时刻, 是否被钉住, 下一处变化, 哪条隧道)。
+
+    形状不对就当作"不是演示时钟"：标记决定这份数据是不是演示，而一个存在但畸形的标记
+    不该被当成实时基础设施（宁可什么都不说，也不要说得像真的）。
+    """
+    demo = payload.get("demo")
+    if not isinstance(demo, Mapping):
+        return None
+    at = _as_float(demo.get("at"))
+    if at is None:
+        return None
+    who = demo.get("next_profile")
+    return (
+        at,
+        bool(demo.get("anchored")),
+        _as_float(demo.get("next_at")),
+        who if isinstance(who, str) else "",
+    )
+
+
+def _demo_controls(payload: Mapping[str, Any]) -> str:
+    """The demo clock: which moment the board is showing, and the buttons that move it.
+
+    Rendered complete on the server, reading included, so a page with scripting off
+    still says which moment it is pinned to; the buttons appear only once the script
+    that implements them is running, because a dead control is worse than none.
+
+    The moment is also on the element as ``data-at``, and the *next* visible change
+    as ``data-next-at`` — that one is computed here, since only the server owns the
+    timeline (见 :func:`ponte.demo._next_change_at`).
+    """
+    clock = _demo_clock(payload)
+    if clock is None:
+        return ""
+    at, anchored, next_at, who = clock
+    if next_at is None:  # pragma: no cover - 演示时间轴总会有下一处变化
+        tail = ""
+    else:
+        # 哪条隧道变、还有多久——按钮只会说"下一处变化"，不说清是哪里的话，用户不知道该往
+        # 哪儿看（而看板上有三行）。
+        tail = f" · 下一处变化 {who + ' ' if who else ''}{_format_duration(max(0.0, next_at - at))}后"
+    next_attr = "" if next_at is None else f"{next_at:.1f}"
+    mode = "已固定" if anchored else "实时"
+    return (
+        f'\n  <span class="democtl" id="democtl" data-at="{at:.1f}"'
+        f' data-anchored="{1 if anchored else 0}" data-next-at="{next_attr}"'
+        f' data-next-profile="{_esc(who)}">'
+        f'<span class="muted">演示时钟 <b id="demoat">{_format_duration(at)}</b>'
+        f'<span id="demostate">（{mode}{tail}）</span></span>'
+        '<span id="demobuttons" hidden>'
+        '<button class="pause" id="demofreeze" type="button">冻结</button>'
+        '<button class="pause" id="demoback" type="button" title="回退 10 秒">−10s</button>'
+        '<button class="pause" id="demofwd" type="button" title="前进 10 秒">+10s</button>'
+        '<button class="pause" id="demonext" type="button"'
+        ' title="跳到下一处看得见的变化">下一处变化</button>'
+        '<button class="pause" id="demolive" type="button" title="去掉锚点，跟随实时">'
+        "回到现在</button>"
+        "</span></span>"
+    )
+
+
+def _at_query(payload: Mapping[str, Any]) -> str:
+    """Put the demo anchor on the footer's links.
+
+    Otherwise a board pinned at 2m32s hands out a ``status.json`` of *now*: the page
+    and the JSON describing two different moments is exactly the kind of disagreement
+    this module exists to avoid. Live demo data has no anchor to carry.
+    """
+    clock = _demo_clock(payload)
+    if clock is None or not clock[1]:
+        return ""
+    return f"?at={clock[0]:.1f}"
 
 
 def _demo_note(payload: Mapping[str, Any]) -> str:
@@ -1348,7 +1587,9 @@ def dashboard_html(
         title="隧道看板",
         summary=_summary(payload, profiles),
         board=board,
+        demo_controls=_demo_controls(payload),
         demo_note=_demo_note(payload),
+        at_query=_at_query(payload),
     )
 
 
@@ -1385,7 +1626,7 @@ class PonteHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
         address: tuple[str, int],
-        provider: Callable[[], dict[str, Any]],
+        provider: Provider,
         *,
         token: str = "",
         refresh: int = 5,
@@ -1482,6 +1723,7 @@ class PonteRequestHandler(BaseHTTPRequestHandler):
         """Route one request: 404 → 401 → the endpoint."""
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        query = parse_qs(parsed.query)
         if path not in _ROUTES:
             self._send_json(
                 404,
@@ -1489,7 +1731,7 @@ class PonteRequestHandler(BaseHTTPRequestHandler):
                 head=head,
             )
             return
-        if not self._authorized(parse_qs(parsed.query)):
+        if not self._authorized(query):
             self._send_json(
                 401,
                 {"error": "unauthorized: missing or invalid token"},
@@ -1499,7 +1741,7 @@ class PonteRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            payload = self._state.provider()
+            payload = self._state.provider(query)
         except Exception as exc:  # noqa: BLE001 - answer, never drop the client
             logger.exception("serve: status provider failed")
             self._send_json(
@@ -1605,7 +1847,7 @@ class PonteRequestHandler(BaseHTTPRequestHandler):
 
 
 def create_server(
-    provider: Callable[[], dict[str, Any]],
+    provider: Provider,
     *,
     host: str = "127.0.0.1",
     port: int = 8787,

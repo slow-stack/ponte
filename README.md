@@ -143,10 +143,19 @@ ponte serve --open     # ...and open it in your browser
 **No tunnels yet?** `ponte serve --demo` runs the same server on built-in sample
 data: a small timeline that connects, drops, backs off and reconnects on its own,
 so the page shows every state it has — healthy, broken, and *unknown* (a probe
-that could not answer). It reads no config and never touches a daemon, and the
-payload (`"demo": true`), the page header and the CLI output all say the data is
-a demo: a dashboard screenshot names your servers, so it must not be mistakable
-for somebody's real infrastructure. Sample hosts use `example.com`.
+that could not answer). A `演示时钟` line in the footer says which moment you are
+looking at, and `冻结` / `−10s` / `+10s` / `下一处变化` / `回到现在` next to it
+drive the timeline: `下一处变化` jumps to the next change that is *visible on the
+board*, so a fault state is one click away instead of 140 seconds of healthy
+staring (two adjacent phases that look identical are skipped — a button landing
+where nothing changed reads as broken). Those buttons only move a number in the
+URL (`?at=<seconds>`): the server holds no state, a live `ponte serve` ignores the
+parameter, and a copied link shows that exact moment to whoever opens it. It reads
+no config and never touches a daemon, and the payload
+(`"demo": {"at": …, "anchored": …, "next_at": …}`), the page header and the CLI
+output all say the data is a demo: a dashboard screenshot names your servers, so
+it must not be mistakable for somebody's real infrastructure. Sample hosts use
+`example.com`.
 
 | Endpoint | What it answers |
 |----------|-----------------|
@@ -470,9 +479,15 @@ ponte serve --open     # 顺手在浏览器里打开
 
 **还没有隧道？** `ponte serve --demo` 用内置的示例数据把同一个服务跑起来：一份自己会
 连接、断线、退避、重连的小时间轴，于是页面上该有的状态都会出现——健康、异常，以及
-**未知**（探针没能得出结论）。它不读配置、也不碰守护进程；payload（`"demo": true`）、
-页面头部与命令行输出三处都写明这是演示数据：看板截图里写着服务器地址与端口，它不该被
-误读成某个人的真实基础设施。示例主机名一律用 `example.com`。
+**未知**（探针没能得出结论）。页脚有一行 `演示时钟` 告诉你现在看的是哪一刻，旁边的
+`冻结` / `−10s` / `+10s` / `下一处变化` / `回到现在` 可以推着它走：`下一处变化` 跳到的是
+**看板上看得见**的下一次变化，于是你不用干等那 140 秒的健康段就能看到故障态（相邻但外观
+相同的两段会被跳过——落在一处什么都没变的地方，按钮看起来就是坏的）。这些按钮只是改
+地址栏里的一个数字（`?at=<秒>`）：服务端不持有任何状态、实时的 `ponte serve` 直接忽略
+它、复制出去的链接谁打开都是同一刻。它不读配置、也不碰守护进程；payload
+（`"demo": {"at": …, "anchored": …, "next_at": …}`）、页面头部与命令行输出三处都写明
+这是演示数据：看板截图里写着服务器地址与端口，它不该被误读成某个人的真实基础设施。
+示例主机名一律用 `example.com`。
 
 | 接口 | 回答什么问题 |
 |------|--------------|

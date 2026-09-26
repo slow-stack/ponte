@@ -92,7 +92,7 @@ def _daemon_with_snapshot(tmp_path: Path, probe: object) -> TunnelDaemon:
 
 def _start(daemon: TunnelDaemon, token: str = "s3cret"):
     server = create_server(
-        lambda: _status_payload(daemon.status()),
+        lambda _query: _status_payload(daemon.status()),
         host="127.0.0.1",
         port=_free_port(),
         token=token,
